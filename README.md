@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.5** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.6** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -110,7 +110,7 @@ sb test-route
 
 ```text
 01 安装/更新核心         17 时间同步
-02 初始化服务            18 系统诊断
+02 安装服务            18 系统诊断
 03 启动                  19 前台调试
 04 停止                  20 修复权限
 05 重启                  21 备份
@@ -118,7 +118,7 @@ sb test-route
 07 日志                  23 磁盘检查
 08 节点信息              24 安全清理
 09 修改监听端口          25 限制日志
-10 出站节点管理          26 BBR 状态
+10 出站节点管理          26 BBR 管理
 11 修复规则下载          28 分流规则管理
 12 中转测试              29 分流测试
 13 日志级别              30 实时监控
@@ -329,3 +329,9 @@ journalctl -u sing-box -n 50 --no-pager
 进入主菜单 10 → 08，或执行 `sb import-node`（别名 `sb import-outbound`）。输入唯一出站标签，再粘贴单条链接；认证信息不回显。支持 VLESS REALITY/TLS TCP/RAW、AnyTLS、Hysteria2 (`hy2://` / `hysteria2://`)、Shadowsocks/SS2022 (`ss://`，无插件)。支持 URL 编码、Base64 认证、IPv6 方括号地址及 HY2 Salamander 混淆。非 TCP VLESS、订阅链接、SS 插件和 Snell 分享链接暂不支持；Snell 仍可手动配置。
 
 AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验证且未修正，会要求风险确认。VLESS 拒绝关闭证书验证。解析结果隐藏密码和 UUID。可选填写预期出口 IP，连接测试成功后才提示应用，沿用配置检查、备份及失败回滚流程。新增出站不会自动修改分流规则。实际连接兼容性须在 VPS 验证。
+
+## v2.2.6 安装服务与 BBR 管理
+
+主菜单 02（`sb inbounds` / `sb install-service`）包含首次部署、查看入站、添加入站和删除入站。已有入站时菜单拒绝重新初始化。新增 HY2、AnyTLS、VLESS REALITY、SS2022、Snell 入站时保留其他节点及出站、路由；删除按标签操作，检查引用并至少保留一个入站。直接命令 `sb add-inbound`、`sb delete-inbound`。修改需确认，会校验配置、备份并重启服务；旧的直接初始化命令仍存在，不要在生产配置上误用。新证书可能在取消或失败后留存，删除入站不会删除证书。
+
+主菜单 26 或 `sb bbr` 支持查看、启用 BBR + fq、恢复原运行时设置。持久化文件 `/etc/sysctl.d/99-sb-bbr.conf`，原设置记录 `/var/lib/sb-manager/bbr-original`。依赖内核支持和 sysctl 权限，容器可能无法修改；其他系统 sysctl 配置可能影响重启后的最终值。BBR 仅影响 TCP。当前尚未完成实机测试。
