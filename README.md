@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.6** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.7** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -322,7 +322,7 @@ journalctl -u sing-box -n 50 --no-pager
 
 ## v2.2.4 Snell 支持
 
-新增 Snell 入站（服务端 v5/v6）和出站（客户端 v4/v6）。初始化三种模式时可选启用，也可在已有服务器通过 `sb add-snell`（主菜单 36）追加 Snell 入站。默认 TCP 8443，需自行开放防火墙及 NAT 映射。节点信息显示 PSK 等连接参数，请勿公开。添加出站时选择 `snell`，配置 PSK、版本等参数，测试通过后再应用。v5 服务端可使用 v4 兼容客户端；不支持 v5 QUIC 模式。需要支持 Snell 的 sing-box 1.14.x 核心。尚未完成实机验证；分享链接导入见 v2.2.5。
+新增 Snell 入站（服务端 v5/v6）和出站（客户端 v4/v6）。初始化三种模式时可选启用，也可在已有服务器通过 `sb add-snell`（现已整合到主菜单 02 → 05）追加 Snell 入站。默认 TCP 8443，需自行开放防火墙及 NAT 映射。节点信息显示 PSK 等连接参数，请勿公开。添加出站时选择 `snell`，配置 PSK、版本等参数，测试通过后再应用。v5 服务端可使用 v4 兼容客户端；不支持 v5 QUIC 模式。需要支持 Snell 的 sing-box 1.14.x 核心。尚未完成实机验证；分享链接导入见 v2.2.5。
 
 ## v2.2.5 分享链接导入
 
@@ -335,3 +335,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 主菜单 02（`sb inbounds` / `sb install-service`）包含首次部署、查看入站、添加入站和删除入站。已有入站时菜单拒绝重新初始化。新增 HY2、AnyTLS、VLESS REALITY、SS2022、Snell 入站时保留其他节点及出站、路由；删除按标签操作，检查引用并至少保留一个入站。直接命令 `sb add-inbound`、`sb delete-inbound`。修改需确认，会校验配置、备份并重启服务；旧的直接初始化命令仍存在，不要在生产配置上误用。新证书可能在取消或失败后留存，删除入站不会删除证书。
 
 主菜单 26 或 `sb bbr` 支持查看、启用 BBR + fq、恢复原运行时设置。持久化文件 `/etc/sysctl.d/99-sb-bbr.conf`，原设置记录 `/var/lib/sb-manager/bbr-original`。依赖内核支持和 sysctl 权限，容器可能无法修改；其他系统 sysctl 配置可能影响重启后的最终值。BBR 仅影响 TCP。当前尚未完成实机测试。
+
+## v2.2.7
+
+移除主菜单 36 的独立 Snell 入站添加选项，统一通过 02 安装服务 → 05 添加协议入站 → snell 管理。保留 `sb add-snell` 快捷命令兼容旧用法。
