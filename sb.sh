@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.12
+VERSION=2.2.13
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -961,18 +961,47 @@ manager_status(){
   printf '默认出口：'; paint '1;32' "$final"; printf '    分流模式：'; paint '1;34' "$mode"; printf '\n'
  else printf '配置状态：未初始化或缺少 jq\n'; fi
 }
+# Return 10 only when new bytes have actually been installed.
+# Return 0 for unchanged/cancelled, 1 for errors. The parent menu reloads on 10.
 self_update() (
- local w v; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
- need curl bash || exit 1
- curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/xiaoxya/sb-manager/main/sb.sh -o "$w/sb.sh" || exit 1
- bash -n "$w/sb.sh" || { err '下载脚本语法检查失败'; exit 1; }
+ local w v stage='' backup_file target=/usr/local/bin/sb
+ w=$(mktemp -d) || exit 1
+ trap 'rm -rf "$w"; [[ -z $stage ]] || rm -f "$stage"' EXIT
+ need curl bash cmp install mktemp mv || exit 1
+ curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/xiaoxya/sb-manager/main/sb.sh -o "$w/sb.sh" || { err '下载失败，保留当前版本'; exit 1; }
+ bash -n "$w/sb.sh" || { err '下载脚本语法检查失败，保留当前版本'; exit 1; }
  v=$(sed -n 's/^VERSION=\([0-9][0-9.]*\)$/\1/p' "$w/sb.sh")
  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err '下载文件版本标识无效'; exit 1; }
- printf '当前版本：%s  仓库版本：%s\n' "$VERSION" "$v"
- if [[ -f /usr/local/bin/sb ]] && cmp -s "$w/sb.sh" /usr/local/bin/sb; then msg OK '管理器已是最新版本'; exit 0; fi
- echo '仅替换管理器，不更新核心、不重启服务；安装器将询问备份确认。'
- bash "$w/sb.sh" install-manager
+ printf '当前运行版本：%s  仓库版本：%s\n' "$VERSION" "$v"
+ if [[ -f $target ]] && cmp -s "$w/sb.sh" "$target"; then
+  if [[ $v != "$VERSION" ]]; then msg OK '磁盘已有新版，重新加载即可'; exit 10; fi
+  msg OK '管理器已是最新版本'; exit 0
+ fi
+ echo '仅替换管理器，不更新核心、不重启服务。'
+ confirm '备份并更新管理器?' || { echo '已取消更新'; exit 0; }
+ [[ ! -L $target && ( ! -e $target || -f $target ) ]] || { err '安装路径不是普通文件，拒绝替换'; exit 1; }
+ stage=$(mktemp /usr/local/bin/.sb-update.XXXXXX) || exit 1
+ install -m 755 "$w/sb.sh" "$stage" && bash -n "$stage" && cmp -s "$stage" "$w/sb.sh" || { err '暂存检查失败'; exit 1; }
+ if [[ -f $target ]]; then
+  backup_file=$(mktemp /usr/local/bin/sb.bak.XXXXXXXX) || exit 1
+  if ! cp -a "$target" "$backup_file"; then rm -f "$backup_file"; err '备份失败，拒绝更新'; exit 1; fi
+  printf '旧版备份：%s\n' "$backup_file"
+ fi
+ mv -fT "$stage" "$target" || { err '替换失败'; exit 1; }
+ stage=''
+ msg OK "已更新至 v$v"
+ exit 10
 )
+self_update_cli(){
+ local rc=0
+ self_update || rc=$?
+ if ((rc==10)); then
+  if [[ -t 0 && -t 1 ]]; then exec /bin/bash /usr/local/bin/sb; fi
+  return 0
+ fi
+ return "$rc"
+}
+
 menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
@@ -982,9 +1011,18 @@ menu(){ local n; while true; do
  paint '1;31' '00 退出管理工具'; printf '\n'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
- dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
+ if [[ $n == 35 || $n == self-update ]]; then
+  local rc=0
+  self_update || rc=$?
+  if ((rc==10)); then
+   exec /bin/bash /usr/local/bin/sb
+   err '新版菜单启动失败，请检查安装文件'
+   return 1
+  fi
+ else dispatch "$n"; fi
+ read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
