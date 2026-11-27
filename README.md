@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.17** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.18** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -375,3 +375,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.17 Argo 网络与健康管理
 
 新增固定隧道默认 `--edge-ip-version 4 --protocol auto`，基于 ARM VPS 上强制 IPv4 后四条 QUIC 连接成功注册的实测。菜单 36 新增 09 重启连接器、10 设置传输协议（auto/quic/http2）、11 设置边缘 IP 版本（auto/4/6）、12 网络环境检测（IPv4 TCP 7844 测试及当前进程 QUIC 预检查日志）、13 公网 VLESS WS TLS 端到端出口测试、14 IPv4 自动修复（IPv4 + auto）。启动验证使用本地 metrics 服务 `/ready`，尝试读取 HA 连接指标；历史注册连接数不等于实时连接数。若 metrics 不可用则报告健康未确认。网络参数通过 `network.conf` 覆盖，兼容已知手工配置，拒绝覆盖未知 ExecStart 或自定义内容；新配置健康检查失败时尝试恢复旧配置。单独删除 Argo 或彻底卸载时清理该已知覆盖文件，保留其他未知覆盖文件。仅更新管理器不会主动重启 Argo 或覆盖已有设置。公网测试不修改正式配置。新版管理逻辑尚未实机验证。
+
+## v2.2.18 DNS 与 IPv6 管理
+
+主菜单 37 或 `sb dns`：查看 DNS 配置、检测 IPv4/IPv6 公网 HTTPS、自动推荐解析策略、手动设置 ipv4_only/prefer_ipv4/ipv6_only/prefer_ipv6、设置 local/UDP/TCP DNS、系统 DNS 解析测试及查看近期 sing-box DNS 错误、恢复原始 DNS 配置。首次修改保存 `/var/lib/sb-manager/dns-original.json`，沿用配置备份、校验与应用失败回滚机制。保留出站专用 resolver，不禁用系统 IPv6，不拦截直接请求 IPv6 地址。设置服务器仅替换唯一的 local-dns 标签所对应的服务器；不提供 DoH/DoT 或多服务器配置。恢复 DNS 段及默认 resolver，并恢复仍匹配的 resolve 规则策略。自动检测仅反映检测端点当前可达性，应用前需要确认。更新管理器不会主动改变 DNS 或重启服务。新功能尚未 VPS 实机测试。
