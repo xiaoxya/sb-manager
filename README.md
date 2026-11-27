@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.27** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.28** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -415,3 +415,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.27 TLS 证书管理
 
 主菜单 38 / `sb cert`。采用 Debian/Ubuntu APT 安装 Certbot 与 Cloudflare DNS 插件，使用独立 `/var/lib/sb-manager/acme` 状态，Let's Encrypt ECC P-256、续期复用私钥；支持 standalone HTTP-01、Cloudflare DNS-01、根域名加通配符、导入现有证书、查看/到期检测、部署、续期、定时器、SPKI 指纹、TCP TLS 验证、备份证书恢复和删除未绑定的 ACME 证书。HTTP-01 要求 TCP 80 公网可达且未被占用，不自动停其他服务；DNS Token 以 0600 文件保存，限对应 Zone。签发与部署分离；仅替换管理器共享证书路径，校验证书私钥匹配和域名覆盖，必要时经确认更新共享证书入站 SNI，备份配置及证书并在失败时尝试回滚。首次换证书可能改变 SPKI，客户端需要同步更新 SNI/固定指纹。自动续期需手动启用 sb-cert-renew.timer，自动部署拒绝 SPKI 或 SNI 不匹配，保留原有服务状态。Argo 公网 TLS 由 Cloudflare 处理，REALITY 不使用该证书；TCP TLS 验证不适用于仅 UDP 的 Hysteria2。卸载移除专用定时器和 ACME 状态，保留可能共享的 Certbot 软件包及默认 Certbot 定时器。更新管理器本身不申请证书、不重启服务。尚未进行真实 CA 签发、续期或 VPS 部署测试。
+
+## v2.2.28 主菜单排序及证书入口修复
+
+主菜单固定左列 01–19、右列 20–38，保持全部原有功能编号；38 增加直接菜单调用，CLI 支持 `sb cert`、`sb certificate` 和 `sb 38`。自更新增加缓存控制及时间戳，并修复退出清理变量作用域。源码复核完成，尚未在 VPS 验证实际菜单运行。
