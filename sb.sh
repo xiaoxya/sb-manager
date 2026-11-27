@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.9
+VERSION=2.2.10
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -489,27 +489,119 @@ proxy_import() (
  edit --slurpfile o "$w/o" '.outbounds += $o'
 )
 # Export native JSON without losing protocol-specific settings. Never overwrite a file.
+# Build a candidate URI; verify it with the importer before exporting.
+outbound_share_candidate(){
+ python3 -c '
+import sys,json,base64,ipaddress
+from urllib.parse import quote,urlencode
+try:
+ o=json.load(sys.stdin); t=o["type"]; host=o["server"]; port=o["server_port"]
+ if ":" in host: host="["+str(ipaddress.IPv6Address(host))+"]"
+ tag=quote(o["tag"],safe="")
+ q={}
+ if t=="shadowsocks":
+  auth=base64.urlsafe_b64encode((o["method"]+":"+o["password"]).encode()).decode().rstrip("=")
+  scheme="ss"
+ elif t in ("vless","anytls","hysteria2"):
+  tls=o["tls"]
+  if not tls.get("enabled"): raise ValueError()
+  if tls.get("server_name"): q["sni"]=tls["server_name"]
+  if "insecure" in tls: q["insecure"]=int(tls["insecure"])
+  if tls.get("alpn"): q["alpn"]=",".join(tls["alpn"])
+  pins=tls.get("certificate_public_key_sha256",[])
+  if pins:
+   if len(pins)!=1 or t=="vless": raise ValueError()
+   q["certificate_public_key_sha256"]=pins[0]
+  if t=="vless":
+   auth=quote(o["uuid"],safe=""); scheme="vless"
+   q.update(encryption="none",type="tcp",security="tls")
+   if o.get("flow"): q["flow"]=o["flow"]
+   utls=tls.get("utls",{})
+   if utls.get("enabled"): q["fp"]=utls.get("fingerprint","chrome")
+   r=tls.get("reality",{})
+   if r.get("enabled"):
+    q.update(security="reality",pbk=r["public_key"],sid=r.get("short_id",""),fp=utls.get("fingerprint","chrome"))
+  else:
+   auth=quote(o["password"],safe=""); scheme=t
+   if t=="hysteria2" and o.get("obfs"):
+    q["obfs"]=o["obfs"]["type"]; q["obfs-password"]=o["obfs"]["password"]
+ else: raise ValueError()
+ print(scheme+"://"+auth+"@"+host+":"+str(port)+("?" + urlencode(q) if q else "")+"#"+tag)
+except Exception: sys.exit(1)
+'
+}
+# Ignore only well-defined equivalent defaults; all other fields must survive.
+outbound_share_equivalent(){
+ jq -e -s '
+ def norm:
+  (if .type=="vless" and .flow=="" then del(.flow) else . end)
+  | (if .type=="vless" and .transport=={"type":"tcp"} then del(.transport) else . end)
+  | (if .tls.insecure==false then del(.tls.insecure) else . end)
+  | (if .tls.alpn==[] then del(.tls.alpn) else . end)
+  | (if .tls.certificate_public_key_sha256==[] then del(.tls.certificate_public_key_sha256) else . end)
+  | (if .tls.server_name==null or .tls.server_name=="" then
+       if .tls.enabled==true then .tls.server_name=.server else . end
+     else . end);
+ length==2 and ((.[0]|norm)==(.[1]|norm))
+ ' "$1" "$2" >/dev/null
+}
 proxy_export() (
- local scope tag path w
+ local scope tag prefix w link n links=0 fallback=0
  [[ -s $C ]] || { err '请先安装服务'; exit 1; }
- need jq || exit 1
+ need jq python3 || exit 1
  scope=$(ask '导出范围 single/all' single) || exit 1
  w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
  case $scope in
  single)
-  proxy_list
-  tag=$(ask '出站标签' '') || exit 1
-  jq -e --arg t "$tag" '[.outbounds[]|select(.tag==$t)]|select(length==1)|{outbounds:.}' "$C" > "$w/export.json" || { err '出站不存在或标签不唯一'; exit 1; };;
- all) jq -e '{outbounds:.outbounds}|select(.outbounds|type=="array")' "$C" > "$w/export.json" || exit 1;;
+  proxy_list; tag=$(ask '出站标签' '') || exit 1
+  jq -e --arg t "$tag" '[.outbounds[]|select(.tag==$t)]|select(length==1)' "$C" > "$w/selected" || { err '出站不存在或标签不唯一'; exit 1; };;
+ all) jq -e '.outbounds|select(type=="array" and length>0)' "$C" > "$w/selected" || exit 1;;
  *) err '无效范围'; exit 1;;
  esac
- echo 'JSON 包含完整认证信息（密码、UUID、PSK 等），请勿公开。'
- path=$(ask '导出路径' "/root/sb-outbounds-$(date +%Y%m%d-%H%M%S).json") || exit 1
- [[ -n $path && ! -e $path && ! -L $path ]] || { err '目标已存在或路径无效'; exit 1; }
+ : > "$w/links.txt"; : > "$w/fallback.ndjson"
+ n=$(jq 'length' "$w/selected") || exit 1
+ for ((i=0;i<n;i++)); do
+  jq --argjson i "$i" '.[$i]' "$w/selected" > "$w/node" || exit 1
+  tag=$(jq -er '.tag' "$w/node") || exit 1
+  if link=$(outbound_share_candidate < "$w/node") &&
+    printf '%s' "$link" | parse_share_link "$tag" > "$w/parsed" 2>/dev/null &&
+    outbound_share_equivalent "$w/node" "$w/parsed"; then
+   printf '%s\n' "$link" >> "$w/links.txt"; ((links+=1))
+   printf '%s: 分享链接\n' "$tag"
+  else
+   jq -c . "$w/node" >> "$w/fallback.ndjson" || exit 1; ((fallback+=1))
+   printf '%s: 原生 JSON（协议或参数无法无损转换）\n' "$tag"
+  fi
+ done
+ unset link
+ jq -s '{outbounds:.}' "$w/fallback.ndjson" > "$w/fallback.json" || exit 1
+ printf '分享链接: %s  JSON 回退: %s\n' "$links" "$fallback"
+ echo '导出包含完整认证信息，请勿公开。'
+ prefix=$(ask '导出路径前缀（不带扩展名）' "/root/sb-outbounds-$(date +%Y%m%d-%H%M%S)") || exit 1
+ [[ -n $prefix ]] || exit 1
  confirm '确认导出敏感配置到文件?' || exit 0
- (umask 077; set -C; cat "$w/export.json" > "$path") || { err '无法创建导出文件'; exit 1; }
- chmod 600 "$path" || exit 1
- msg OK "已导出：$path"
+ # Exclusive creation; on failure remove only files created by this invocation.
+ python3 - "$prefix" "$w" "$links" "$fallback" <<'PYEXPORT'
+import sys,os
+prefix,w,links,fallback=sys.argv[1:]
+items=[]
+if int(links): items.append((w+"/links.txt",prefix+".txt"))
+if int(fallback): items.append((w+"/fallback.json",prefix+".json"))
+created=[]
+try:
+ for src,dst in items:
+  fd=os.open(dst,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  created.append(dst)
+  with os.fdopen(fd,"wb") as f,open(src,"rb") as r: f.write(r.read())
+except OSError:
+ for p in created:
+  try: os.unlink(p)
+  except OSError: pass
+ print("导出失败：文件已存在或路径不可写",file=sys.stderr); sys.exit(1)
+for p in created: print("已导出："+p)
+PYEXPORT
+ [[ $? == 0 ]] || exit 1
+ if ((links)) && confirm '在终端显示分享链接（包含认证信息）?'; then cat "$w/links.txt"; fi
 )
 show_help(){
  cat <<HELP
@@ -545,7 +637,7 @@ sing-box Manager v$VERSION
   outbounds              出站管理菜单
   change-relay           修改中转出站
   import-node            导入分享链接（别名 import-outbound）
-  export-outbound        导出单个或全部出站 JSON（含认证信息）
+  export-outbound        优先导出分享链接，不可无损转换则导出 JSON
   relay [出口IP]         测试中转
   test-outbound 标签 [出口IP]
                          测试指定出站
