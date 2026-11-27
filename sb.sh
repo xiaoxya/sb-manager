@@ -2,12 +2,18 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.0
+VERSION=2.2.1
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
 META=/etc/sing-box/sb-host
 BASE=https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite
+
+# Color is presentation only; prompts must not contaminate captured values.
+ui_color(){ [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; }
+paint(){ local c=$1; shift; if ui_color; then printf '\033[%sm%s\033[0m' "$c" "$*"; else printf '%s' "$*"; fi; }
+ui_title(){ printf '\n'; paint '1;36' "==== $* ===="; printf '\n'; }
+ui_prompt(){ if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then printf '\033[1;36m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
 msg(){ printf '\n[%s] %s\n' "$1" "$2"; }
 err(){ msg ERROR "$*" >&2; return 1; }
 ask(){ local a; read -rp "$1 [$2]: " a || return 1; printf '%s' "${a:-$2}"; }
@@ -162,12 +168,12 @@ clean(){ confirm '清理APT缓存、压缩旧日志至100MB（不删除内核）
 limit_logs(){ confirm '设置 journald 最大100MB（影响全系统）?' || return; mkdir -p /etc/systemd/journald.conf.d; printf '[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\n' > /etc/systemd/journald.conf.d/90-sb.conf; systemctl restart systemd-journald; }
 # 保留旧版 taiwan-out 标签用于无损升级；新配置使用 relay-out。
 relay_tag(){ jq -er '[.outbounds[]? | select(.tag=="relay-out" or .tag=="taiwan-out")][0].tag' "$C"; }
-init_menu(){ local n; echo '1. 入口中转（智能分流）'; echo '2. 落地服务（独立节点及中转接收）'; echo '0. 返回'; read -rp '选择: ' n || return; case $n in 1) init_role entry;; 2) init_role landing;; 0) return 0;; *) err '无效选项';; esac; }
+init_menu(){ local n; echo '1. 入口中转（智能分流）'; echo '2. 落地服务（独立节点及中转接收）'; echo '0. 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1) init_role entry;; 2) init_role landing;; 0) return 0;; *) err '无效选项';; esac; }
 route_list(){ jq -r '"默认出站: \(.route.final // "未设置")", "--- 路由规则（索引从0开始，按顺序匹配） ---", ((.route.rules // [])|to_entries[]|"\(.key): \(.value|tojson)"), "--- 规则集 ---", ((.route.rule_set // [])[]|"\(.tag): \(.type) \(.url // .path // "")"), "--- 出站 ---", (.outbounds[]|"\(.tag) [\(.type)]")' "$C"; }
 route_index(){ [[ $1 =~ ^(0|[1-9][0-9]{0,6})$ ]] && (( $1 < $(jq '.route.rules // [] | length' "$C") )); }
 route_target(){ local t; jq -r '.outbounds[]|"\(.tag) [\(.type)]"' "$C" >&2; t=$(ask '目标出站标签（或 reject）' direct) || return 1; if [[ $t != reject ]]; then jq -e --arg t "$t" 'any(.outbounds[]; .tag==$t)' "$C" >/dev/null || return 1; fi; printf '%s' "$t"; }
 route_build(){ local k v t a; k=$(ask '匹配类型 domain/domain_suffix/domain_keyword/domain_regex/ip_cidr/rule_set' domain_suffix) || return 1; case $k in domain|domain_suffix|domain_keyword|domain_regex|ip_cidr|rule_set) ;; *) err '不支持的匹配类型'; return 1;; esac; v=$(ask '匹配值，多个用英文逗号分隔' '') || return 1; a=$(jq -cn --arg v "$v" '$v|split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))') || return 1; [[ $a != '[]' ]] || return 1; if [[ $k == ip_cidr ]]; then python3 -c 'import ipaddress,json,sys; [ipaddress.ip_network(x,strict=False) for x in json.loads(sys.argv[1])]' "$a" || return 1; fi; if [[ $k == rule_set ]]; then jq -e --argjson a "$a" '(.route.rule_set // [] | map(.tag)) as $tags | all($a[]; . as $x | $tags|index($x)!=null)' "$C" >/dev/null || { err '规则集不存在'; return 1; }; fi; t=$(route_target) || return 1; jq -cn --arg k "$k" --argjson a "$a" --arg t "$t" '{($k):$a} + (if $t=="reject" then {action:"reject"} else {action:"route",outbound:$t} end)'; }
-legacy_route_manage(){ local n i j r t url fmt interval; [[ -s $C ]] || { err '请先初始化'; return 1; }; while true; do echo; echo '==== 分流规则管理 ===='; columns '1 查看规则及出站|2 添加规则|3 修改规则|4 删除规则|5 调整规则顺序' '6 添加远程规则集|7 删除未引用规则集|8 设置默认出站|0 返回'; read -rp '选择: ' n || return; case $n in
+legacy_route_manage(){ local n i j r t url fmt interval; [[ -s $C ]] || { err '请先初始化'; return 1; }; while true; do echo; ui_title '分流规则管理'; columns '1 查看规则及出站|2 添加规则|3 修改规则|4 删除规则|5 调整规则顺序' '6 添加远程规则集|7 删除未引用规则集|8 设置默认出站|0 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in
 1) route_list;;
 2) route_list; r=$(route_build) || continue; i=$(ask '插入索引（在指定规则之前）' "$(jq '(.route.rules // []) | ([to_entries[] | select(.value.action!="sniff" and (.value.ip_is_private!=true or .value.action!="reject")) | .key][0] // length)' "$C")") || continue; [[ $i =~ ^(0|[1-9][0-9]{0,6})$ ]] && ((i <= $(jq '.route.rules // [] | length' "$C"))) || { err '索引无效'; continue; }; confirm '应用新规则（将重启服务）?' && edit --argjson i "$i" --argjson r "$r" '.route.rules=((.route.rules // [])| .[:$i]+[$r]+.[$i:])';;
 3|4) route_list; i=$(ask '规则索引' '') || continue; route_index "$i" || { err '索引无效'; continue; }; if jq -e --argjson i "$i" '.route.rules[$i]|(.action=="sniff" or .action=="resolve" or .ip_is_private==true)' "$C" >/dev/null; then confirm '这是基础安全/解析规则，仍然修改或删除?' || continue; fi; if [[ $n == 3 ]]; then r=$(route_build) || continue; confirm '替换该规则?' && edit --argjson i "$i" --argjson r "$r" '.route.rules[$i]=$r'; else confirm '删除该规则?' && edit --argjson i "$i" 'del(.route.rules[$i])'; fi;;
@@ -192,19 +198,37 @@ legacy_menu(){ while true; do cat <<MENU
 31 域名统计        32 AnyTLS连接    33 网卡速率
 34 设置公网地址    0 退出
 MENU
- local n; read -rp '选择: ' n || return; case $n in 0) return;; *) dispatch "$n";; esac; read -rp '回车继续...' _ || return; done; }
+ local n; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 0) return;; *) dispatch "$n";; esac; read -rp '回车继续...' _ || return; done; }
 legacy_dispatch(){ case ${1:-} in
 1|update) install_core;; 2|02|init) init_menu;; init-entry|init-hk) init_role entry;; init-landing|init-tw) init_role landing;; 28|rules) route_manage;; 3|start) systemctl start sing-box;; 4|stop) systemctl stop sing-box;; 5|restart) systemctl restart sing-box;; 6|status) systemctl status sing-box --no-pager -l;; 7|logs) journalctl -u sing-box -n 30 -f -o cat;; 8|info) info;; 9|port) change_port;; 10|change-relay) change_relay;; 11|fix-rules) fix_rules;; 12|relay) relay "${2:-}";; 13) local l; l=$(ask '日志级别' info); edit --arg l "$l" '.log.level=$l';; 14|test) reality_test;; 15) local k; k=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") && public_key "$k";; 16) tls_target;; 17) ntp;; 18|diagnose) diagnose;; 19) foreground;; 20|fix-perm) permissions;; 21|backup) backup;; 22|restore) restore;; 23|disk) disk;; 24|clean) clean;; 25) limit_logs;; 26) sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control net.core.default_qdisc;; 27) local a; a=$(ask 'enable/disable' enable); case $a in enable|disable) systemctl "$a" sing-box;; esac;; 29|test-route) route_test;; 30|monitor) monitor;; 31) local period; period=$(ask '统计时间（1 hour/24 hours）' '1 hour'); journalctl -u sing-box --since "$period ago" -o cat --no-pager | sed -n 's/.*inbound connection to //p' | sort | uniq -c | sort -nr | head -50;; 32) local p; p=$(jq -r '.inbounds[]|select(.tag=="anytls-in")|.listen_port' "$C"); watch -n 1 "ss -tinp 'sport = :$p'";; 33) command -v nload >/dev/null || apt-get install -y nload; nload;; 34) local h; h=$(ask '公网地址' ''); [[ -n $h ]] && printf '%s\n' "$h" > "$META";; install-manager) if [[ $(readlink -f "$0") == /usr/local/bin/sb ]]; then return 0; fi; if [[ -e /usr/local/bin/sb ]]; then confirm "备份并替换旧 sb?" || return 0; cp -a /usr/local/bin/sb "/usr/local/bin/sb.bak.$(date +%s)" || return 1; fi; install -m 755 "$0" /usr/local/bin/sb;; '') menu;; *) err '未知命令';; esac; }
 # v2.2: use screen-cell width rather than byte width for Chinese menus.
-columns(){ local width; width=$(tput cols 2>/dev/null || echo 80); [[ $width =~ ^[0-9]+$ ]] || width=80; python3 -c 'import sys,unicodedata as u
-w=int(sys.argv[1]); a,b=sys.argv[2].split("|"),sys.argv[3].split("|")
+columns(){
+ local width color=0; width=$(tput cols 2>/dev/null || echo 80); [[ $width =~ ^[0-9]+$ ]] || width=80; ui_color && color=1
+ if ! command -v python3 >/dev/null; then printf '%s\n' "$1" "$2" | tr '|' '\n'; return; fi
+ python3 -c 'import sys,unicodedata as u,re
+w=int(sys.argv[1]); a,b=sys.argv[2].split("|"),sys.argv[3].split("|"); color=sys.argv[4]=="1"
 def cells(s): return sum(0 if u.combining(c) else 2 if u.east_asian_width(c) in "WF" else 1 for c in s)
-if w<90 or max(map(cells,a))+max(map(cells,b))+4>w: print("\n".join(a+b))
+def p(s,c): return "\033["+c+"m"+s+"\033[0m" if color else s
+def fmt(s):
+ if s.startswith("◆"): return p(s,"1;36")
+ m=re.match(r"^(\d+)(\s+)(.*)$",s)
+ if not m: return s
+ n,sp,label=m.groups()
+ if int(n)==0: return p(s,"1;31")
+ c=""
+ if any(x in label for x in ("停止","退出")): c="1;31"
+ elif any(x in label for x in ("初始化","恢复","重启","清理","删除","更新核心")): c="1;33"
+ elif any(x in label for x in ("分流","中转","出站")): c="1;34"
+ return p(n,"1;32")+sp+(p(label,c) if c else label)
+if w<90 or max(map(cells,a))+max(map(cells,b))+4>w:
+ for x in a+b:
+  if x: print(fmt(x))
 else:
  n=max(map(cells,a))+4
  for i in range(max(len(a),len(b))):
-  l=a[i] if i<len(a) else ""; r=b[i] if i<len(b) else ""; print(l+" "*max(0,n-cells(l))+r)' "$width" "$1" "$2"; }
-init_menu(){ local n; echo '01 独立代理（单 VPS）'; echo '02 入口中转'; echo '03 落地服务'; echo '00 返回'; read -rp '选择: ' n || return; case $n in 1|01) init_role standalone;; 2|02) init_role entry;; 3|03) init_role landing;; 0|00) return;; *) err '无效选项';; esac; }
+  l=a[i] if i<len(a) else ""; r=b[i] if i<len(b) else ""; print(fmt(l)+(" "*max(0,n-cells(l))+fmt(r) if r else ""))' "$width" "$1" "$2" "$color"
+}
+init_menu(){ local n; ui_title '初始化 sing-box 服务'; columns '01 独立代理（单 VPS）|02 入口中转|03 落地服务|00 返回' ''; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) init_role standalone;; 2|02) init_role entry;; 3|03) init_role landing;; 0|00) return;; *) err '无效选项';; esac; }
 proxy_list(){ jq -r '.outbounds[]|[.tag,.type,(.server // "-"),(.server_port // "-")]|@tsv' "$C"; }
 select_proxy(){ local t; proxy_list >&2; t=$(ask '出站标签' "${1:-relay-out}") || return 1; jq -e --arg t "$t" 'any(.outbounds[];.tag==$t and (.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="direct"))' "$C" >/dev/null || { err '出站不存在或类型不支持'; return 1; }; printf '%s' "$t"; }
 proxy_test() ( local t=$1 w; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT; jq -e --arg t "$t" '.outbounds[]|select(.tag==$t)' "$C" > "$w/o" || exit 1; if jq -e 'has("detour")' "$w/o" >/dev/null; then err '链式 detour 出站暂不支持独立测试'; exit 1; fi; jq 'if .server then .domain_resolver={server:"local-dns",strategy:"ipv4_only"} else . end' "$w/o" > "$w/test" || exit 1; probe "$w/test" "${2:-}"; )
@@ -213,7 +237,7 @@ proxy_change() ( local op=$1 t w exp; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w
 proxy_delete(){ local t; t=$(select_proxy) || return 1; [[ $t != direct ]] || { err '不能删除直连出站'; return 1; }; # conservative reference check, includes saved policies
  if jq -e --arg t "$t" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' "$C" >/dev/null || { [[ -s $POLICY ]] && jq -e --arg t "$t" 'any(..|strings;.==$t)' "$POLICY" >/dev/null; }; then err '仍被配置或已保存策略引用'; return 1; fi; confirm '删除出站?' && edit --arg t "$t" '.outbounds |= map(select(.tag!=$t))'; }
 set_final(){ local t; t=$(route_target) || return 1; [[ $t != reject ]] || return 1; confirm '修改默认出站?' && edit --arg t "$t" '.route.final=$t'; }
-proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|00 返回'; read -rp '选择: ' n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks")|.tag' "$C");; 0|00) return;; esac; done; }
+proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks")|.tag' "$C");; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
 POLICY=/etc/sing-box/sb-policy.json
 policy_ready(){ if [[ ! -e $POLICY ]]; then printf '{"disabled":[],"saved":null}\n' > "$POLICY"; fi; jq -e 'type=="object" and (.disabled|type=="array")' "$POLICY" >/dev/null; }
@@ -224,9 +248,48 @@ mode_switch(){ local m t snapshot; policy_ready || return 1; m=$(ask '模式 sma
 route_export(){ local f; policy_ready || return 1; f=$(ask '导出文件路径' "/root/sb-routing-$(date +%s).json") || return 1; [[ ! -e $f ]] || { err '文件已存在'; return 1; }; jq --slurpfile p "$POLICY" '{route:{rules:.route.rules,rule_set:(.route.rule_set // []),final:.route.final},policy:$p[0]}' "$C" > "$f" && echo "已导出 $f（规则 URL 可能包含令牌，请保密）"; }
 route_import(){ local f; policy_normal || return 1; f=$(ask '导入文件路径' '') || return 1; jq -e '.route.rules|type=="array"' "$f" >/dev/null || return 1; # only active rules imported; metadata is intentionally not imported
  confirm '替换当前活动分流规则及规则集？保留本机 DNS/出站，不导入禁用规则' || return 0; edit --slurpfile p "$f" '.route.rules=$p[0].route.rules|.route.rule_set=$p[0].route.rule_set|.route.final=$p[0].route.final'; }
-add_preset(){ local n name tag target url w; policy_normal || return 1; columns '01 AI 全部|02 OpenAI|03 Claude|04 Gemini|05 Crypto 全部|06 Binance|07 OKX|08 Web3|09 TikTok|10 Netflix|11 YouTube|12 Disney+|13 Spotify|14 Twitch' '15 Telegram|16 Twitter/X|17 Discord|18 GitHub|19 Google|20 Microsoft|21 Apple|22 Cloudflare|23 国外游戏|24 Speedtest|25 广告拦截|26 中国大陆域名|27 中国大陆IP'; echo '支持逗号多选；每个规则集先下载检测'; n=$(ask '编号' '') || return 1; target=$(route_target) || return 1; local -a names=(none 'category-ai-!cn' openai anthropic google-gemini category-cryptocurrency binance okx web3 tiktok netflix youtube disney spotify twitch telegram twitter discord github google microsoft apple cloudflare category-games-!cn speedtest category-ads-all cn cn); local -a picks; IFS=, read -ra picks <<< "$n"; for n in "${picks[@]}"; do [[ $n =~ ^[0-9]{1,2}$ ]] || return 1; n=$((10#$n)); ((n>=1 && n<=27)) || return 1; name=${names[n]}; tag="preset-$name"; url="$BASE/$name.srs"; if ((n==27)); then tag=preset-geoip-cn; url="${BASE%/geosite}/geoip/cn.srs"; fi; if ! curl -fsSL --max-time 25 -o /dev/null "$url"; then err "上游规则集不可用: $name，跳过"; continue; fi; confirm "添加 $tag → $target?" || continue; edit --arg tag "$tag" --arg url "$url" --arg t "$target" '.http_clients=((.http_clients // [])|if any(.[];.tag=="rule-download") then . else .+[{tag:"rule-download"}] end)|.route.default_http_client=(.route.default_http_client // "rule-download")|.route.rule_set=((.route.rule_set // [])|if any(.[];.tag==$tag) then . else .+[{type:"remote",tag:$tag,format:"binary",url:$url,update_interval:"24h"}] end)|.route.rules |= (([to_entries[]|select(.value.action=="resolve")|.key][0] // length) as $i | .[:$i]+[({rule_set:[$tag]}+(if $t=="reject" then {action:"reject"} else {action:"route",outbound:$t} end))]+.[$i:])' || return 1; done; }
-route_manage(){ local n; [[ -s $C ]] || return 1; policy_ready || return 1; while true; do echo '==== 分流规则管理 ===='; jq -r '"默认出站: \(.route.final) | 活动规则: \(.route.rules|length)"' "$C"; columns '01 查看规则|02 添加/修改/删除/排序规则|05 启用/禁用规则|07 添加预设规则集|08 自定义规则集管理' '13 设置默认出站|14 切换分流模式|15 测试域名/IP|16 实时日志|17 导入配置|18 导出配置|00 返回'; read -rp '选择: ' n || return; case $n in 1|01) route_list; jq '.disabled' "$POLICY";; 2|02|8|08) policy_normal && legacy_route_manage;; 5|05) rule_toggle;; 7|07) add_preset;; 13) policy_normal && set_final;; 14) mode_switch;; 15) route_test;; 16) monitor;; 17) route_import;; 18) route_export;; 0|00) return;; esac; done; }
-menu(){ local n; while true; do echo "==== sing-box Manager v$VERSION ===="; systemctl is-active sing-box 2>/dev/null || :; [[ ! -s $C ]] || jq -r '"入站: \(.inbounds|length) | 出站: \(.outbounds|length) | 默认: \(.route.final)"' "$C"; columns '01 安装/更新核心|02 初始化服务|03 启动|04 停止|05 重启|06 状态|07 日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY测试|15 REALITY公钥|16 TLS目标|27 开机启动' '17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份|22 恢复JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR状态|28 分流规则管理|29 分流测试|30 实时监控|31 域名统计|32 AnyTLS连接|33 网卡速率|34 公网地址'; echo '00 退出'; read -rp '选择: ' n || return; [[ $n == 0 || $n == 00 ]] && return; dispatch "$n"; read -rp '回车继续...' _ || return; done; }
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+add_preset(){ local n name tag target url w; policy_normal || return 1; ui_title '预设规则集管理'; columns '01 AI 全部|02 OpenAI|03 Claude|04 Gemini|05 Crypto 全部|06 Binance|07 OKX|08 Web3|09 TikTok|10 Netflix|11 YouTube|12 Disney+|13 Spotify|14 Twitch' '15 Telegram|16 Twitter/X|17 Discord|18 GitHub|19 Google|20 Microsoft|21 Apple|22 Cloudflare|23 国外游戏|24 Speedtest|25 广告拦截|26 中国大陆域名|27 中国大陆IP'; echo '支持逗号多选；每个规则集先下载检测'; n=$(ask '编号' '') || return 1; target=$(route_target) || return 1; local -a names=(none 'category-ai-!cn' openai anthropic google-gemini category-cryptocurrency binance okx web3 tiktok netflix youtube disney spotify twitch telegram twitter discord github google microsoft apple cloudflare category-games-!cn speedtest category-ads-all cn cn); local -a picks; IFS=, read -ra picks <<< "$n"; for n in "${picks[@]}"; do [[ $n =~ ^[0-9]{1,2}$ ]] || return 1; n=$((10#$n)); ((n>=1 && n<=27)) || return 1; name=${names[n]}; tag="preset-$name"; url="$BASE/$name.srs"; if ((n==27)); then tag=preset-geoip-cn; url="${BASE%/geosite}/geoip/cn.srs"; fi; if ! curl -fsSL --max-time 25 -o /dev/null "$url"; then err "上游规则集不可用: $name，跳过"; continue; fi; confirm "添加 $tag → $target?" || continue; edit --arg tag "$tag" --arg url "$url" --arg t "$target" '.http_clients=((.http_clients // [])|if any(.[];.tag=="rule-download") then . else .+[{tag:"rule-download"}] end)|.route.default_http_client=(.route.default_http_client // "rule-download")|.route.rule_set=((.route.rule_set // [])|if any(.[];.tag==$tag) then . else .+[{type:"remote",tag:$tag,format:"binary",url:$url,update_interval:"24h"}] end)|.route.rules |= (([to_entries[]|select(.value.action=="resolve")|.key][0] // length) as $i | .[:$i]+[({rule_set:[$tag]}+(if $t=="reject" then {action:"reject"} else {action:"route",outbound:$t} end))]+.[$i:])' || return 1; done; }
+route_manage(){ local n; [[ -s $C ]] || return 1; policy_ready || return 1; while true; do ui_title '分流规则管理'; jq -r '"默认出站: \(.route.final) | 活动规则: \(.route.rules|length)"' "$C"; columns '01 查看规则|02 添加/修改/删除/排序规则|05 启用/禁用规则|07 添加预设规则集|08 自定义规则集管理' '13 设置默认出站|14 切换分流模式|15 测试域名/IP|16 实时日志|17 导入配置|18 导出配置|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) route_list; jq '.disabled' "$POLICY";; 2|02|8|08) policy_normal && legacy_route_manage;; 5|05) rule_toggle;; 7|07) add_preset;; 13) policy_normal && set_final;; 14) mode_switch;; 15) route_test;; 16) monitor;; 17) route_import;; 18) route_export;; 0|00) return;; esac; done; }
+manager_status(){
+ local st core final mode
+ st=$(systemctl is-active sing-box 2>/dev/null || :)
+ core=$(sing-box version 2>/dev/null | head -n 1); core=${core#sing-box version }; core=${core:-未安装}
+ printf '服务状态：'; case $st in active) paint '1;32' '● 运行中';; activating|deactivating) paint '1;33' "$st";; *) paint '1;31' "未运行 (${st:-unknown})";; esac
+ printf '    核心版本：%s\n' "$core"
+ if [[ -s $C ]] && command -v jq >/dev/null; then
+  jq -r '"入站节点：\(.inbounds|length)    出站节点：\(.outbounds|length)    活动规则：\(.route.rules // [] | length)"' "$C" 2>/dev/null || :
+  final=$(jq -r '.route.final // "(未设置)"' "$C" 2>/dev/null)
+  mode='智能分流/自定义'
+  if [[ -s $POLICY ]] && jq -e '.saved != null' "$POLICY" >/dev/null 2>&1; then
+   if [[ $final == direct ]]; then mode='全局直连'; else mode='全局中转'; fi
+  elif jq -e 'all(.outbounds[]; .type=="direct")' "$C" >/dev/null 2>&1; then mode='仅本机出口'; fi
+  printf '默认出口：'; paint '1;32' "$final"; printf '    分流模式：'; paint '1;34' "$mode"; printf '\n'
+ else printf '配置状态：未初始化或缺少 jq\n'; fi
+}
+self_update() (
+ local w v; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ need curl bash || exit 1
+ curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/xiaoxya/sb-manager/main/sb.sh -o "$w/sb.sh" || exit 1
+ bash -n "$w/sb.sh" || { err '下载脚本语法检查失败'; exit 1; }
+ v=$(sed -n 's/^VERSION=\([0-9][0-9.]*\)$/\1/p' "$w/sb.sh")
+ [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err '下载文件版本标识无效'; exit 1; }
+ printf '当前版本：%s  仓库版本：%s\n' "$VERSION" "$v"
+ if [[ -f /usr/local/bin/sb ]] && cmp -s "$w/sb.sh" /usr/local/bin/sb; then msg OK '管理器已是最新版本'; exit 0; fi
+ echo '仅替换管理器，不更新核心、不重启服务；安装器将询问备份确认。'
+ bash "$w/sb.sh" install-manager
+)
+menu(){ local n; while true; do
+ if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
+ ui_title "sing-box Manager v$VERSION"; manager_status
+ paint '36' '--------------------------------------------------------'; printf '\n'
+ columns '◆ 服务与节点管理|01 安装/更新核心|02 初始化服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 状态|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址'
+ paint '36' '--------------------------------------------------------'; printf '\n'
+ columns '35 更新管理器' '00 退出管理工具'
+ read -rp "$(ui_prompt '请输入功能编号：')" n || return
+ [[ $n == 0 || $n == 00 ]] && return
+ dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
+ done; }
+
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; dispatch "$@"; fi
