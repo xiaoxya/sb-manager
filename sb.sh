@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.20
+VERSION=2.2.21
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1117,7 +1117,7 @@ policy_ready(){ policy_migrate || return 1; install -d -m 700 "${POLICY%/*}" || 
 policy_edit(){ local f; f=$(mktemp "${POLICY%/*}/.policy.XXXXXX") || return 1; if jq "$@" "$POLICY" > "$f"; then mv "$f" "$POLICY"; else rm -f "$f"; return 1; fi; }
 policy_normal(){ policy_ready && jq -e '.saved==null' "$POLICY" >/dev/null || { err '请先切回智能分流模式'; return 1; }; }
 rule_toggle(){ local i r; policy_normal || return 1; route_list; jq -r '.disabled|to_entries[]|"禁用索引 \(.key): \(.value.rule|tojson)"' "$POLICY"; local action; action=$(ask 'disable/enable' disable) || return 1; i=$(ask '规则索引' '') || return 1; [[ $i =~ ^(0|[1-9][0-9]{0,6})$ ]] || return 1; if [[ $action == disable ]]; then route_index "$i" || return 1; r=$(jq -c --argjson i "$i" '.route.rules[$i]' "$C") || return 1; jq -e '(.action=="sniff" or .action=="resolve" or .ip_is_private==true)|not' <<< "$r" >/dev/null || { err '基础规则不可禁用'; return 1; }; confirm '禁用规则?' || return 0; policy_edit --argjson r "$r" --argjson i "$i" '.disabled += [{rule:$r,index:$i}]' || return 1; if ! edit --argjson i "$i" 'del(.route.rules[$i])'; then policy_edit '.disabled |= .[:-1]'; return 1; fi; elif [[ $action == enable ]]; then r=$(jq -ce --argjson i "$i" '.disabled[$i]' "$POLICY") || return 1; confirm '恢复规则（请检查优先级）?' || return 0; edit --argjson r "$r" '.route.rules |= (.[:$r.index]+[$r.rule]+.[$r.index:])' && policy_edit --argjson i "$i" 'del(.disabled[$i])'; fi; }
-mode_switch(){ local m t snapshot; policy_ready || return 1; m=$(ask '模式 smart/direct/relay' smart) || return 1; case $m in smart) jq -e '.saved!=null' "$POLICY" >/dev/null || return 0; confirm '恢复原智能分流规则?' && edit --slurpfile p "$POLICY" '.route.rules=$p[0].saved.rules|.route.final=$p[0].saved.final' && policy_edit '.saved=null';; direct|relay) t=direct; [[ $m == direct ]] || { t=$(select_proxy) || return 1; [[ $t != direct ]] || return 1; }; confirm '切换全局模式（保留基础嗅探、解析及私网拒绝）?' || return 0; if jq -e '.saved==null' "$POLICY" >/dev/null; then snapshot=$(jq -c '.route|{rules,final}' "$C") || return 1; policy_edit --argjson r "$snapshot" '.saved=$r' || return 1; if ! edit --arg t "$t" '.route.rules |= map(select(.action=="sniff" or .action=="resolve" or (.ip_is_private==true and .action=="reject")))|.route.final=$t'; then policy_edit '.saved=null'; return 1; fi; else edit --arg t "$t" '.route.final=$t'; fi;; *) err '无效模式';; esac; }
+mode_switch(){ local m t snapshot; policy_ready || return 1; m=$(ask '模式 smart/direct/relay' smart) || return 1; case $m in smart) jq -e '.saved!=null' "$POLICY" >/dev/null || return 0; confirm '恢复原智能分流规则?' && edit --slurpfile p "$POLICY" '.route.rules=$p[0].saved.rules|.route.final=$p[0].saved.final' && policy_edit '.saved=null';; direct|relay) t=direct; [[ $m == direct ]] || { t=$(select_proxy) || return 1; [[ $t != direct ]] || return 1; }; confirm '切换全局模式（保留基础嗅探、解析及私网拒绝）?' || return 0; if jq -e '.saved==null' "$POLICY" >/dev/null; then snapshot=$(jq -c '.route|{rules,final}' "$C") || return 1; policy_edit --argjson r "$snapshot" '.saved=$r' || return 1; if ! edit --arg t "$t" '.route.rules |= map(select(.action=="sniff" or .action=="resolve" or (.ip_is_private==true and .action=="reject") or .=={"ip_version":6,"action":"reject","method":"default","no_drop":true}))|.route.final=$t'; then policy_edit '.saved=null'; return 1; fi; else edit --arg t "$t" '.route.final=$t'; fi;; *) err '无效模式';; esac; }
 route_export(){ local f; policy_ready || return 1; f=$(ask '导出文件路径' "/root/sb-routing-$(date +%s).json") || return 1; [[ ! -e $f ]] || { err '文件已存在'; return 1; }; jq --slurpfile p "$POLICY" '{route:{rules:.route.rules,rule_set:(.route.rule_set // []),final:.route.final},policy:$p[0]}' "$C" > "$f" && echo "已导出 $f（规则 URL 可能包含令牌，请保密）"; }
 route_import(){ local f; policy_normal || return 1; f=$(ask '导入文件路径' '') || return 1; jq -e '.route.rules|type=="array"' "$f" >/dev/null || return 1; # only active rules imported; metadata is intentionally not imported
  confirm '替换当前活动分流规则及规则集？保留本机 DNS/出站，不导入禁用规则' || return 0; edit --slurpfile p "$f" '.route.rules=$p[0].route.rules|.route.rule_set=$p[0].route.rule_set|.route.final=$p[0].route.final'; }
@@ -1493,6 +1493,65 @@ ipv6_change() (
  if ((had)); then cp -a "$w/old" "$IPV6_CONF" || :; else rm -f "$IPV6_CONF" || :; fi
  exit 1
 )
+IPV6_BLOCK_RULE='{"ip_version":6,"action":"reject","method":"default","no_drop":true}'
+ipv6_block_status(){
+ [[ -s $C ]] || { err '请先初始化服务'; return 1; }
+ jq --argjson r "$IPV6_BLOCK_RULE" '{managed_rule_first:(.route.rules[0]==$r),ipv6_reject_rules:[.route.rules[]?|select(.ip_version==6 and .action=="reject")],dns_strategy:(.dns.strategy//"核心默认")}' "$C"
+}
+ipv6_block(){
+ [[ -s $C ]] || { err '请先初始化服务'; return 1; }
+ local op=$1
+ if [[ $op == on ]]; then
+  confirm '在路由最前面拒绝 IPv6 目标（影响所有入站及中转），重启 sing-box?' || return 0
+  edit --argjson r "$IPV6_BLOCK_RULE" '.route.rules=([$r]+[(.route.rules//[])[]|select(.!=$r)])'
+ else
+  confirm '删除本功能使用的 IPv6 拒绝规则，重启 sing-box？不改变系统 IPv6 或 DNS' || return 0
+  edit --argjson r "$IPV6_BLOCK_RULE" '.route.rules |= map(select(.!=$r))'
+ fi
+}
+ipv4_only_mode() (
+ local answer w had=0 newstate=0 p ok=1 current
+ [[ -s $C ]] || { err '请先初始化服务'; exit 1; }
+ [[ -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || { err '内核 IPv6 sysctl 不可用，请分别管理 DNS 和路由'; exit 1; }
+ [[ ! -e $IPV6_CONF || -s $IPV6_STATE ]] || { err '已有来源不明的 IPv6 配置，请先手动处理'; exit 1; }
+ if [[ -s $POLICY ]] && jq -e '.saved!=null' "$POLICY" >/dev/null; then err '请先恢复智能分流，再启用一键模式'; exit 1; fi
+ echo '将设置 DNS 为 ipv4_only、拒绝 IPv6 目标、禁用系统 IPv6。影响所有入站与中转。请使用 IPv4 SSH；IPv6 专用节点可能不可用。'
+ echo 'Argo 已配置时另行检查并确认 IPv4 网络修复；不会无条件覆盖现有隧道配置。'
+ read -rp '确认请输入 IPV4ONLY：' answer || exit 1
+ [[ $answer == IPV4ONLY ]] || exit 0
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ ipv6_capture > "$w/before" || exit 1
+ if [[ -e $IPV6_CONF ]]; then cp -a "$IPV6_CONF" "$w/old" || exit 1; had=1; fi
+ jq --argjson r "$IPV6_BLOCK_RULE" '
+ .dns.strategy="ipv4_only" |
+ (.route.rules[]?|select(.action=="resolve")|.strategy)="ipv4_only" |
+ (if (.route.default_domain_resolver|type)=="object" then .route.default_domain_resolver.strategy="ipv4_only" else . end) |
+ .route.rules=([$r]+[(.route.rules//[])[]|select(.!=$r)])' "$C" > "$w/new" || exit 1
+ check "$w/new" || exit 1
+ dns_snapshot || exit 1
+ install -d -m 700 /var/lib/sb-manager || exit 1
+ if [[ ! -s $IPV6_STATE ]]; then install -m 600 "$w/before" "$IPV6_STATE" || exit 1; newstate=1; fi
+ printf 'net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 1\n' > "$w/sysctl"
+ for p in /proc/sys/net/ipv6/conf/all/disable_ipv6 /proc/sys/net/ipv6/conf/default/disable_ipv6 /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [[ -e $p ]] || continue
+  if [[ $(cat "$p") != 1 ]]; then printf '1\n' > "$p" || { ok=0; break; }; fi
+ done
+ if ! ((ok)) || ! install -m 644 "$w/sysctl" "$IPV6_CONF" || ! apply "$w/new"; then
+  err '一键模式应用失败，尝试恢复操作前的系统 IPv6 状态'
+  if ipv6_restore_runtime "$w/before"; then
+   if ((had)); then cp -a "$w/old" "$IPV6_CONF" || exit 1; else rm -f "$IPV6_CONF" || exit 1; fi
+   if ((newstate)); then rm -f "$IPV6_STATE"; fi
+  else err '系统恢复失败，保留原始状态记录'; fi
+  exit 1
+ fi
+ msg OK '系统 IPv6、DNS 和路由设置已应用'
+ if [[ -s $ARGO_UNIT ]]; then
+  current=$(systemctl show sb-argo.service -p ExecStart --value 2>/dev/null) || current=''
+  if grep -Eq -- '--edge-ip-version[ =]+4([ ;]|$)' <<< "$current"; then echo 'Argo 已配置 IPv4，无需修改'; argo_health || :
+  else echo 'Argo 尚未显式设置 IPv4；可确认执行 IPv4 自动修复'; argo_network_set repair || { err 'Argo 修复未成功；其余三项已应用，请单独检查'; exit 1; }; fi
+ fi
+ echo '恢复方法：19 解除路由拦截、10 恢复 DNS、15 恢复系统 IPv6；Argo 网络参数在菜单 36 单独管理。'
+)
 dns_menu(){
  local n
  while true; do
@@ -1500,11 +1559,12 @@ dns_menu(){
  if [[ -s $C ]]; then jq -r '"默认 DNS 策略："+(.dns.strategy//"核心默认")' "$C"; fi
  columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4|06 仅使用 IPv6' '07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置|11 主备 DNS 切换|12 DNS 连通及耗时测试'
  columns '13 系统 IPv6 状态|14 禁用系统 IPv6' '15 恢复系统 IPv6|16 启用系统 IPv6'
+ columns '17 IPv6 拦截状态|18 拦截 IPv6 流量' '19 解除 IPv6 拦截|20 一键 IPv4-only 模式'
  echo '00 返回'
  read -rp "$(ui_prompt '请选择操作：')" n || return
  case $n in
   1|01) dns_show;; 2|02) dns_network;; 3|03) dns_auto;; 4|04) dns_strategy ipv4_only;; 5|05) dns_strategy prefer_ipv4;;
-  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;; 11) dns_swap;; 12) dns_probe_configured;; 13) ipv6_status;; 14) ipv6_change 1;; 15) ipv6_restore;; 16) ipv6_change 0;;
+  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;; 11) dns_swap;; 12) dns_probe_configured;; 13) ipv6_status;; 14) ipv6_change 1;; 15) ipv6_restore;; 16) ipv6_change 0;; 17) ipv6_block_status;; 18) ipv6_block on;; 19) ipv6_block off;; 20) ipv4_only_mode;;
   0|00) return;; *) err '无效选项';;
  esac
  done
