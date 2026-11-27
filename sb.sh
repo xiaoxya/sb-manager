@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.14
+VERSION=2.2.15
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -518,7 +518,7 @@ def fmt(s):
  m=re.match(r"^(\d+)(\s+)(.*)$",s)
  if not m: return s
  n,sp,label=m.groups()
- if int(n)==0: return p(s,"1;31")
+ if int(n) in (0,99): return p(s,"1;31")
  c=""
  if any(x in label for x in ("停止","退出")): c="1;31"
  elif any(x in label for x in ("初始化","恢复","重启","清理","删除","更新核心")): c="1;33"
@@ -784,6 +784,25 @@ PYEXPORT
  [[ $? == 0 ]] || exit 1
  if ((links)) && confirm '在终端显示分享链接（包含认证信息）?'; then cat "$w/links.txt"; fi
 )
+# Uninstall only the installed management executable, not the proxy service.
+uninstall_manager(){
+ local target=/usr/local/bin/sb answer
+ if [[ ! -e $target && ! -L $target ]]; then msg OK '管理器未安装，无需卸载'; return 0; fi
+ [[ -f $target && ! -L $target ]] || { err '管理器路径不是普通文件，拒绝删除'; return 1; }
+ echo '仅删除 /usr/local/bin/sb。保留 sing-box 核心、服务、节点、证书、规则、BBR、Argo 及所有备份。'
+ read -r -p "$(ui_prompt '确认卸载请输入 UNINSTALL：')" answer || return 2
+ if [[ $answer != UNINSTALL ]]; then echo '已取消卸载'; return 2; fi
+ rm -- "$target" || { err '卸载失败'; return 1; }
+ hash -r
+ msg OK '管理器已卸载，sing-box 服务未停止。'
+ return 0
+}
+uninstall_manager_cli(){
+ local rc=0
+ uninstall_manager || rc=$?
+ [[ $rc == 2 ]] && return 0
+ return "$rc"
+}
 show_help(){
  cat <<HELP
 sing-box Manager v$VERSION
@@ -798,6 +817,7 @@ sing-box Manager v$VERSION
 安装及更新
   install-manager        安装当前脚本到 /usr/local/bin/sb
   self-update            从 GitHub 更新管理器（不更新核心）
+  uninstall-manager      卸载管理器（保留核心、服务、配置及备份）
   update                 安装/更新 sing-box 核心
   init / install-service / inbounds
                          安装服务及入站管理菜单
@@ -838,6 +858,7 @@ sing-box Manager v$VERSION
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
   01-36                  对应主菜单编号
+  99                     卸载管理器
   部分维护功能仅提供数字菜单入口。
 
 示例：
@@ -1063,9 +1084,14 @@ menu(){ local n; while true; do
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
- paint '1;31' '00 退出管理工具'; printf '\n'
+ columns '00 退出管理工具' '99 卸载管理器'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
+ if [[ $n == 99 || $n == uninstall-manager ]]; then
+  if uninstall_manager; then return 0; fi
+  read -rp "$(ui_prompt '回车继续...')" _ || return
+  continue
+ fi
  if [[ $n == 35 || $n == self-update ]]; then
   local rc=0
   self_update || rc=$?
@@ -1078,6 +1104,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
