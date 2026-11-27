@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.22
+VERSION=2.2.23
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -292,21 +292,92 @@ if all(k in a and k in b for k in keys[:2]) and b["TcpOutSegs"]>a["TcpOutSegs"] 
  print("TCP 重传段/发送段近似比率：%.2f%%"%(100*(b["TcpRetransSegs"]-a["TcpRetransSegs"])/(b["TcpOutSegs"]-a["TcpOutSegs"])))' "$before" "$after"
  echo '以上是整个系统 TCP 统计，不是 QUIC 丢包率，也不是单个 YouTube 连接。'
 }
-argo_video_diagnose(){
- local log host
- log=$(journalctl -u sing-box --since '30 minutes ago' --no-pager -o cat) || return 1
- echo '最近 30 分钟视频相关日志（最多 40 行）：'
- grep -Ei 'googlevideo\.com|youtube\.com' <<< "$log" | tail -40 || :
- echo '近期视频域名 VPS 直连 HTTPS 测试（不经过 Argo）：'
- while IFS= read -r host; do
-  [[ $host =~ ^[A-Za-z0-9.-]+\.googlevideo\.com$ ]] || continue
-  printf '%s ' "$host"
-  curl -4 --noproxy '*' -sS -o /dev/null --connect-timeout 5 --max-time 12 -w 'HTTP %{http_code} DNS %{time_namelookup}s TCP %{time_connect}s TLS %{time_appconnect}s 总计 %{time_total}s\n' "https://$host/" || :
- done < <(grep -Eo '[A-Za-z0-9.-]+\.googlevideo\.com' <<< "$log" | sort -u | head -5)
- echo 'CDN 根路径返回 403/404 不代表视频播放失败；此测试不验证真实视频分片。'
- echo '同期 sing-box 错误（可能包含其他客户端）：'
- grep -Ei 'ERROR|broken pipe|reset by peer|i/o timeout' <<< "$log" | tail -25 || :
+# Only use original inbound/outbound connection targets, never DNS CNAME targets.
+argo_video_extract(){
+ python3 - "$1" <<'PYVIDEO'
+import re,sys
+lines=open(sys.argv[1],encoding="utf-8",errors="replace").read().splitlines()
+target=re.compile(r'(?:inbound|outbound) connection to ([a-z0-9.-]+\.googlevideo\.com):443(?:\s|$)',re.I)
+seen=set()
+for line in reversed(lines):
+ m=target.search(line)
+ if not m: continue
+ host=m.group(1).lower()
+ if host not in seen:
+  print(host)
+  seen.add(host)
+  if len(seen)==5: break
+PYVIDEO
 }
+argo_video_errors(){
+ python3 - "$1" <<'PYERROR'
+import re,sys
+lines=open(sys.argv[1],encoding="utf-8",errors="replace").read().splitlines()
+idre=re.compile(r'\[(\d+)\s+[^]]+\]')
+video=re.compile(r'(?:inbound|outbound) connection to [a-z0-9.-]+\.(?:googlevideo|youtube)\.com(?::\d+)?(?:\s|$)',re.I)
+ids={m.group(1) for l in lines if video.search(l) and (m:=idre.search(l))}
+groups={"视频相关错误":[],"IPv6 历史错误":[],"其他错误":[]}
+for l in lines:
+ if not re.search(r'\bERROR\b|broken pipe|reset by peer|i/o timeout',l,re.I): continue
+ m=idre.search(l)
+ key="视频相关错误" if m and m.group(1) in ids else "IPv6 历史错误" if re.search(r'\[[0-9a-f:]*:[0-9a-f:]+\]:\d+',l,re.I) else "其他错误"
+ groups[key].append(l)
+for k,ls in groups.items():
+ print(f"{k}：{len(ls)} 条")
+ for l in ls[-10:]: print("  "+l)
+print("统计的是日志行，不是断线次数；仅关联采样窗口内可识别的连接 ID。")
+PYERROR
+}
+argo_video_diagnose() (
+ local w period samples host i rc result total=0 good=0 bad=0
+ period=$(ask '日志范围（分钟，1-1440）' 30) || exit 1
+ samples=$(ask '每个 CDN 测试次数（1-3）' 2) || exit 1
+ [[ $period =~ ^[0-9]{1,4}$ && $samples =~ ^[1-3]$ ]] && ((10#$period>=1 && 10#$period<=1440)) || { err '参数无效'; exit 1; }
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ journalctl -u sing-box --since "$((10#$period)) minutes ago" --no-pager -o cat > "$w/log" || exit 1
+ argo_video_extract "$w/log" > "$w/hosts" || exit 1
+ echo '最近视频连接日志（最多 20 行）：'
+ grep -Ei '(inbound|outbound) connection to .* (.*googlevideo|.*youtube)|connection to [A-Za-z0-9.-]+\.(googlevideo|youtube)\.com:' "$w/log" | tail -20 || :
+ echo '仅测试最近实际连接的原始 CDN 域名，不测试 DNS CNAME。'
+ : > "$w/results"
+ while IFS= read -r host; do
+  for ((i=1;i<=samples;i++)); do
+   rc=0
+   result=$(curl -4 --noproxy '*' -sS -o /dev/null --connect-timeout 5 --max-time 12 -w '%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}' "https://$host/" 2>"$w/curlerr") || rc=$?
+   printf '%s\t%s\t%s\t%s\n' "$host" "$i" "$rc" "$result" >> "$w/results"
+   if ((rc)); then printf '%s #%s curl=%s: ' "$host" "$i" "$rc"; head -1 "$w/curlerr"; fi
+  done
+ done < "$w/hosts"
+ python3 - "$w/results" <<'PYRESULT'
+import sys,statistics
+ok=[]; failed=0; n=0
+print("CDN / 次数 / HTTP / DNS / TCP阶段 / TLS阶段 / 首字节 / 总耗时（ms）")
+for line in open(sys.argv[1]):
+ h,i,r,v=line.rstrip("\n").split("\t",3)
+ n+=1
+ if int(r):
+  failed+=1
+  label={6:"DNS 失败",7:"TCP 连接失败",28:"超时",35:"TLS 握手失败",60:"TLS 证书验证失败"}.get(int(r),"传输失败")
+  print(f"{h} #{i} {label} (curl {r})")
+  continue
+ try:
+  code,d,c,t,first,end=v.split()
+  d,c,t,first,end=map(float,(d,c,t,first,end))
+ except ValueError:
+  failed+=1; print(f"{h} #{i} 测试结果无法解析"); continue
+ if code=="000":
+  failed+=1; print(f"{h} #{i} 未收到 HTTP 响应"); continue
+ ok.append(end*1000)
+ print(f"{h} #{i} {code} {d*1000:.2f} {max(0,c-d)*1000:.2f} {max(0,t-c)*1000:.2f} {first*1000:.2f} {end*1000:.2f} HTTPS可达")
+print(f"有效 HTTPS 响应：{len(ok)}/{n}；失败：{failed}")
+if ok: print(f"成功样本总耗时：平均 {statistics.mean(ok):.2f} ms，最小 {min(ok):.2f} ms，最大 {max(ok):.2f} ms")
+if not n: print("未发现实际 CDN 连接目标，请先播放视频。")
+elif failed: print("存在直连测试失败，请结合错误类型检查。")
+else: print("已测试 CDN HTTPS 可达，持续视频传输尚未验证。")
+PYRESULT
+ echo 'HTTP 403/404 仅表示根路径收到响应；测试使用 VPS 系统 DNS 和 IPv4 直连，不经过 Argo。'
+ argo_video_errors "$w/log"
+)
 argo_repeat_probe(){
  local n i ok=0 fail=0
  n=$(ask '重复公网节点测试次数（1-10）' 3) || return 1
