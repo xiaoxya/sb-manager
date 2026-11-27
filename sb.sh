@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.15
+VERSION=2.2.16
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -67,7 +67,7 @@ argo_install_core(){
  else
   printf '%s\n' 'deb [signed-by=/usr/share/keyrings/sb-cloudflare.gpg] https://pkg.cloudflare.com/cloudflared any main' > "$list" || return 1
  fi
- apt-get update && apt-get install -y cloudflared
+ apt-get update && apt-get install -y cloudflared && { install -d -m 700 /var/lib/sb-manager && touch /var/lib/sb-manager/cloudflared-installed; }
 }
 argo_setup() (
  local w p host path uuid token bin
@@ -463,7 +463,7 @@ route_test() (
 monitor(){ local filter; filter=$(ask '日志筛选（all/ai/crypto/tiktok/anytls/relay-client）' all); case $filter in relay-client|hk-relay) filter="relay-client|hk-relay";; ai) filter='openai|chatgpt|claude|anthropic|gemini|grok|perplexity|aistudio';; crypto) filter='binance|okx|bybit|bitget|metamask|etherscan';; tiktok) filter='tiktok|byteoversea';; all) filter='.';; esac; journalctl -u sing-box -n 0 -f -o cat | grep --line-buffered -Ei "$filter"; }
 restore(){ local f; ls -1d "$B"/* 2>/dev/null; f=$(ask '输入完整备份目录' ''); [[ -f $f/sing-box/config.json ]] || return 1; confirm '恢复 JSON（证书需与备份一致）?' && apply "$f/sing-box/config.json"; }
 change_port(){ local tag p; jq -r '.inbounds[]|"\(.tag) \(.listen_port)"' "$C"; tag=$(ask '入站标签' anytls-in); jq -e --arg t "$tag" 'any(.inbounds[];.tag==$t)' "$C" >/dev/null || return 1; p=$(ask '内部监听端口' ''); port "$p" || return 1; edit --arg t "$tag" --argjson p "$((10#$p))" '(.inbounds[]|select(.tag==$t)|.listen_port)=$p'; }
-ntp(){ case $(virt) in podman|docker|lxc|openvz|container*) echo '容器时间由宿主机管理'; date -u;; *) apt-get install -y systemd-timesyncd && systemctl enable --now systemd-timesyncd; timedatectl status;; esac; }
+ntp(){ case $(virt) in podman|docker|lxc|openvz|container*) echo '容器时间由宿主机管理'; date -u;; *) local existed=0; dpkg-query -W -f='${db:Status-Status}' systemd-timesyncd 2>/dev/null | grep -qx installed && existed=1; apt-get install -y systemd-timesyncd || return 1; if (( ! existed )); then install -d -m 700 /var/lib/sb-manager && touch /var/lib/sb-manager/timesyncd-installed || return 1; fi; systemctl enable --now systemd-timesyncd; timedatectl status;; esac; }
 diagnose(){ cat /etc/os-release; virt; date -u; sing-box version; systemctl status sing-box --no-pager; ss -lntup; df -h /; jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="snell")|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C"; journalctl -u sing-box -n 20 --no-pager; }
 tls_target(){ local t; t=$(ask 'REALITY目标域名' www.apple.com); timeout 10 openssl s_client -connect "$t:443" -servername "$t" -tls1_3 -brief </dev/null; if confirm '修改 REALITY 目标?'; then edit --arg t "$t" '(.inbounds[]|select(.tag=="vless-reality-in")|.tls.server_name)=$t|(.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.handshake.server)=$t'; fi; }
 foreground() ( confirm '停止正式服务并前台调试?' || exit 0; local active=0; systemctl is-active --quiet sing-box && active=1; trap '((active==0)) || systemctl start sing-box' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; systemctl stop sing-box && sing-box run -D "$D" -c "$C"; )
@@ -784,22 +784,117 @@ PYEXPORT
  [[ $? == 0 ]] || exit 1
  if ((links)) && confirm '在终端显示分享链接（包含认证信息）?'; then cat "$w/links.txt"; fi
 )
-# Uninstall only the installed management executable, not the proxy service.
-uninstall_manager(){
- local target=/usr/local/bin/sb answer
- if [[ ! -e $target && ! -L $target ]]; then msg OK '管理器未安装，无需卸载'; return 0; fi
- [[ -f $target && ! -L $target ]] || { err '管理器路径不是普通文件，拒绝删除'; return 1; }
- echo '仅删除 /usr/local/bin/sb。保留 sing-box 核心、服务、节点、证书、规则、BBR、Argo 及所有备份。'
- read -r -p "$(ui_prompt '确认卸载请输入 UNINSTALL：')" answer || return 2
- if [[ $answer != UNINSTALL ]]; then echo '已取消卸载'; return 2; fi
- rm -- "$target" || { err '卸载失败'; return 1; }
- hash -r
- msg OK '管理器已卸载，sing-box 服务未停止。'
- return 0
+# Full removal of the managed proxy stack. Keep unrelated/shared OS components.
+purge_service_package(){
+ local pkg=$1 plan name
+ dpkg-query -W "$pkg" >/dev/null 2>&1 || return 0
+ plan=$(LC_ALL=C apt-get -s purge "$pkg") || return 1
+ while read -r name; do
+  [[ -z $name || $name == "$pkg" || $name == "$pkg":* ]] || { err "卸载 $pkg 将影响其他软件包 $name，拒绝自动卸载"; return 1; }
+ done < <(awk '/^(Remv|Purg) /{print $2}' <<< "$plan")
+ apt-get -y purge "$pkg"
 }
+stop_managed_unit(){
+ local unit=$1 load
+ load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || :
+ if [[ $load == not-found || -z $load ]]; then
+  if systemctl is-active --quiet "$unit"; then systemctl stop "$unit" || return 1; fi
+  return 0
+ fi
+ systemctl stop "$unit" || return 1
+ systemctl disable "$unit" || return 1
+ ! systemctl is-active --quiet "$unit"
+}
+uninstall_service(){
+ local answer pkg old q p owner cloud_owned=0 keep_cloud=0
+ local -a leftovers=()
+ need systemctl dpkg-query apt-get sysctl || return 1
+ [[ -d /run/systemd/system ]] || { err 'systemd 不可用，无法安全停止服务'; return 1; }
+ echo '彻底卸载将停止 sing-box 和 sb-argo，删除核心、节点、证书、规则、缓存、管理器及其备份。'
+ echo '删除 /root/sb-backups 和默认路径的节点/规则导出文件；无法恢复。请先另行保存需要的数据。'
+ echo '恢复本工具保存的 BBR 参数，移除本工具的 journald 限额。共用系统依赖及其他应用不强制删除。'
+ echo 'Cloudflare 云端 Tunnel/DNS 不会删除。若 SSH 依赖代理或隧道，请先切换至独立连接。'
+ read -r -p "$(ui_prompt '确认彻底卸载请输入 PURGE：')" answer || return 2
+ [[ $answer == PURGE ]] || { echo '已取消卸载'; return 2; }
+ [[ -f /etc/apt/sources.list.d/sb-cloudflared.list || -f /var/lib/sb-manager/cloudflared-installed ]] && cloud_owned=1
+ stop_managed_unit sb-argo.service && stop_managed_unit sing-box.service || { err '停止服务失败，未继续删除'; return 1; }
+ # Do not remove a connector used by another service or manually running process.
+ if command -v cloudflared >/dev/null || dpkg-query -W cloudflared >/dev/null 2>&1; then
+  if pgrep -x cloudflared >/dev/null 2>&1 ||
+    systemctl list-unit-files --no-legend 'cloudflared*.service' 2>/dev/null | grep -q '^cloudflared' ||
+    [[ -e /etc/cloudflared || -e /root/.cloudflared ]]; then
+   keep_cloud=1
+  elif (( ! cloud_owned )); then
+   if ! confirm '检测到来源不明的 cloudflared，确认仅供本管理器使用并卸载?'; then keep_cloud=1; fi
+  fi
+  if (( ! keep_cloud )); then
+   purge_service_package cloudflared || return 1
+   if command -v cloudflared >/dev/null; then
+    p=$(command -v cloudflared)
+    if [[ $p == /usr/local/bin/cloudflared || $p == /usr/bin/cloudflared ]]; then
+     if ! dpkg-query -S "$p" >/dev/null 2>&1; then rm -f -- "$p" || return 1; fi
+    fi
+   fi
+  fi
+ fi
+ for pkg in sing-box sing-box-beta sing-box-alpha; do purge_service_package "$pkg" || return 1; done
+ # Official package purge removes packaged files; clean known manual installations too.
+ for p in /usr/local/bin/sing-box /usr/bin/sing-box /etc/systemd/system/sing-box.service; do
+  if [[ -e $p || -L $p ]]; then
+   if dpkg-query -S "$p" >/dev/null 2>&1; then leftovers+=("$p (其他软件包所有)"); else rm -f -- "$p" || return 1; fi
+  fi
+ done
+ if [[ -e $BBR_CONF || -e $BBR_STATE ]]; then
+  if [[ -s $BBR_STATE ]]; then
+   { read -r old; read -r q; } < "$BBR_STATE"
+   [[ $old =~ ^[A-Za-z0-9_]+$ && $q =~ ^[A-Za-z0-9_]+$ ]] || { err 'BBR 原值记录无效，请手动恢复后重试'; return 1; }
+   sysctl -w "net.ipv4.tcp_congestion_control=$old" "net.core.default_qdisc=$q" || { err 'BBR 恢复失败，保留记录，请处理后重试'; return 1; }
+  else echo '未找到 BBR 原值记录，仅移除持久化文件；当前内核运行值需手动检查。'; fi
+  rm -f -- "$BBR_CONF" "$BBR_STATE" || return 1
+ fi
+ if [[ -f /etc/systemd/journald.conf.d/90-sb.conf ]]; then
+  rm -f /etc/systemd/journald.conf.d/90-sb.conf || return 1
+  systemctl restart systemd-journald || { err 'journald 重新加载失败'; return 1; }
+ fi
+ # Time sync is a system service, not proxy-exclusive. Remove only if ownership is known
+ # and the operator explicitly agrees, or explicitly confirms an older untracked install.
+ if dpkg-query -W -f='${db:Status-Status}' systemd-timesyncd 2>/dev/null | grep -qx installed; then
+  if [[ -f /var/lib/sb-manager/timesyncd-installed ]]; then
+   if confirm '本工具曾安装 systemd-timesyncd，是否一并卸载（影响全系统时间同步）?'; then
+    stop_managed_unit systemd-timesyncd.service && purge_service_package systemd-timesyncd || return 1
+   fi
+  else
+   echo 'systemd-timesyncd 来源未记录，默认保留。'
+   if confirm '确认时间同步服务仅由本工具安装且不再需要，是否卸载?'; then
+    stop_managed_unit systemd-timesyncd.service && purge_service_package systemd-timesyncd || return 1
+   fi
+  fi
+ fi
+ rm -f -- "$ARGO_UNIT" /etc/apt/sources.list.d/sb-cloudflared.list || return 1
+ # Do not remove a signing key still referenced by another repository.
+ if ! grep -RqsF /usr/share/keyrings/sb-cloudflare.gpg /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+  rm -f /usr/share/keyrings/sb-cloudflare.gpg || return 1
+ fi
+ rm -rf --one-file-system -- /etc/sing-box /var/lib/sing-box /var/cache/sing-box /var/log/sing-box /etc/sb-argo /var/lib/sb-manager /etc/systemd/system/sing-box.service.d /root/sb-backups || return 1
+ # Only remove files matching the manager's default generated names.
+ for p in /root/sb-outbounds-*.txt /root/sb-outbounds-*.json /root/sb-routing-*.json /usr/local/bin/sb.bak.*; do
+  [[ -f $p || -L $p ]] || continue
+  rm -f -- "$p" || return 1
+ done
+ systemctl daemon-reload || return 1
+ systemctl reset-failed sing-box.service sb-argo.service 2>/dev/null || :
+ if systemctl is-active --quiet sing-box.service || systemctl is-active --quiet sb-argo.service; then err '服务仍在运行，保留管理器供排查'; return 1; fi
+ if command -v sing-box >/dev/null; then leftovers+=("$(command -v sing-box) (未识别的核心路径)"); fi
+ if ((keep_cloud)); then echo '检测到其他用途或来源不明的 cloudflared，已保留。'; fi
+ if (("${#leftovers[@]}" > 0)); then printf '未自动清除：%s\n' "${leftovers[@]}"; err '请检查残留项后重试；管理器已保留'; return 1; fi
+ rm -f -- /usr/local/bin/sb || return 1
+ hash -r
+ msg OK '本工具管理的代理服务和已知配置已卸载；共用组件、系统日志及云端资源不强制清除。'
+}
+uninstall_manager(){ uninstall_service; }
 uninstall_manager_cli(){
  local rc=0
- uninstall_manager || rc=$?
+ uninstall_service || rc=$?
  [[ $rc == 2 ]] && return 0
  return "$rc"
 }
@@ -817,7 +912,8 @@ sing-box Manager v$VERSION
 安装及更新
   install-manager        安装当前脚本到 /usr/local/bin/sb
   self-update            从 GitHub 更新管理器（不更新核心）
-  uninstall-manager      卸载管理器（保留核心、服务、配置及备份）
+  uninstall-service      彻底卸载代理服务及管理器（删除配置和备份）
+  uninstall-manager      同上（兼容旧命令，行为已变更）
   update                 安装/更新 sing-box 核心
   init / install-service / inbounds
                          安装服务及入站管理菜单
@@ -858,7 +954,7 @@ sing-box Manager v$VERSION
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
   01-36                  对应主菜单编号
-  99                     卸载管理器
+  99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
 示例：
@@ -1084,10 +1180,10 @@ menu(){ local n; while true; do
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '00 退出管理工具' '99 卸载管理器'
+ columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
- if [[ $n == 99 || $n == uninstall-manager ]]; then
+ if [[ $n == 99 || $n == uninstall-manager || $n == uninstall-service ]]; then
   if uninstall_manager; then return 0; fi
   read -rp "$(ui_prompt '回车继续...')" _ || return
   continue
@@ -1104,6 +1200,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
