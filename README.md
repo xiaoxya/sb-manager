@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.7** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.9** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -339,3 +339,9 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.7
 
 移除主菜单 36 的独立 Snell 入站添加选项，统一通过 02 安装服务 → 05 添加协议入站 → snell 管理。保留 `sb add-snell` 快捷命令兼容旧用法。
+
+## v2.2.9 帮助与出站导出
+
+`sb --help` / `sb -h` / `sb help` 查看命令帮助，`sb --version` / `sb -v` 查看版本，均无需 root。菜单 08 / `sb info` 仅显示入站节点信息，不再附加出站配置。
+
+菜单 10 → 09 或 `sb export-outbound`（别名 `sb export-node`）导出单个或全部出站为原生 JSON 对象 `{"outbounds":[...]}`。默认路径 `/root/sb-outbounds-年月日-时分秒.json`，不覆盖已有文件，权限 600。导出包含认证信息，需确认并妥善保存。该文件并非完整 sing-box 配置，也不能直接通过分享链接导入菜单导入。导出不修改运行配置或重启服务。
