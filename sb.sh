@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.26
+VERSION=2.2.27
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1232,6 +1232,12 @@ uninstall_service(){
  if ! grep -RqsF /usr/share/keyrings/sb-cloudflare.gpg /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
   rm -f /usr/share/keyrings/sb-cloudflare.gpg || return 1
  fi
+ if [[ -e /etc/systemd/system/sb-cert-renew.timer ]]; then
+  systemctl disable --now sb-cert-renew.timer || return 1
+  systemctl stop sb-cert-renew.service || return 1
+  rm -f /etc/systemd/system/sb-cert-renew.timer /etc/systemd/system/sb-cert-renew.service || return 1
+  systemctl daemon-reload || return 1
+ fi
  rm -rf --one-file-system -- /etc/sing-box /var/lib/sing-box /var/cache/sing-box /var/log/sing-box /etc/sb-argo /var/lib/sb-manager /etc/systemd/system/sing-box.service.d /root/sb-backups || return 1
  # Only remove files matching the manager's default generated names.
  for p in /root/sb-outbounds-*.txt /root/sb-outbounds-*.json /root/sb-routing-*.json /usr/local/bin/sb.bak.*; do
@@ -1313,7 +1319,8 @@ sing-box Manager v$VERSION
   argo                   固定 Argo 隧道管理
   argo-stability         Argo 稳定性诊断
   dns                    DNS 与 IPv6 管理（含系统级 IPv6 启停）
-  01-37                  对应主菜单编号
+  cert                   TLS 证书管理
+  01-38                  对应主菜单编号
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
@@ -1800,6 +1807,221 @@ dns_menu(){
  esac
  done
 }
+# Use distro packaged Certbot, with a separate ACME state directory and timer.
+ACME_DIR=/var/lib/sb-manager/acme
+ACME_LIVE=/var/lib/sb-manager/acme/config/live
+ACME_DEPLOY=/etc/sing-box/cert
+ACME_HOOK=/var/lib/sb-manager/acme/deploy-domain
+acme_cmd(){ certbot --config-dir "$ACME_DIR/config" --work-dir "$ACME_DIR/work" --logs-dir "$ACME_DIR/logs" "$@"; }
+acme_domain(){
+ python3 -c 'import re,sys
+s=sys.argv[1].lower().rstrip(".")
+assert len(s)<=253 and "." in s and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",x) for x in s.split("."))
+print(s)' "$1" 2>/dev/null
+}
+acme_install(){
+ apt-get install -y certbot python3-certbot-dns-cloudflare ca-certificates openssl || return 1
+ install -d -m 700 "$ACME_DIR" "$ACME_DIR/config" "$ACME_DIR/work" "$ACME_DIR/logs"
+}
+acme_issue(){
+ local mode=$1 domain email token cred
+ local -a args names
+ need certbot openssl python3 || return 1
+ domain=$(ask '域名（不含协议、端口、星号）' '') || return 1
+ domain=$(acme_domain "$domain") || { err '域名格式错误'; return 1; }
+ email=$(ask 'ACME 联系邮箱' '') || return 1
+ [[ $email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || { err '邮箱格式错误'; return 1; }
+ install -d -m 700 "$ACME_DIR" || return 1
+ [[ ! -e $ACME_DIR/config/renewal/$domain.conf ]] || { err '已有同名证书，请使用续期'; return 1; }
+ names=(-d "$domain")
+ args=(--server https://acme-v02.api.letsencrypt.org/directory --cert-name "$domain" --key-type ecdsa --elliptic-curve secp256r1 --reuse-key --agree-tos --non-interactive --email "$email")
+ if [[ $mode == http ]]; then
+  [[ -z $(ss -H -lnt 'sport = :80') ]] || { err 'TCP 80 已被占用，不自动停止其他服务'; return 1; }
+  echo 'HTTP-01 要求公网 DNS A/AAAA 正确指向本机且 TCP 80 可达；请检查防火墙与 CDN。'
+  confirm '确认 HTTP-01 验证条件已满足?' || return 0
+  args+=(--standalone --preferred-challenges http)
+ else
+  cred="$ACME_DIR/$domain.cloudflare.ini"
+  echo 'Cloudflare Token 仅授权对应 Zone 的 DNS Edit / Zone Read；不会显示或写入日志。'
+  read -rsp 'Cloudflare API Token: ' token || return 1
+  echo
+  [[ $token =~ ^[A-Za-z0-9_-]+$ ]] || { err 'Token 格式无效'; return 1; }
+  [[ ! -e $cred ]] || { err '已有凭据文件，请先检查，不覆盖'; return 1; }
+  (umask 077; printf 'dns_cloudflare_api_token = %s\n' "$token" > "$cred") || return 1
+  unset token
+  args+=(--dns-cloudflare --dns-cloudflare-credentials "$cred" --dns-cloudflare-propagation-seconds 60)
+  [[ $mode != wildcard ]] || names+=(-d "*.$domain")
+ fi
+ if acme_cmd certonly "${args[@]}" "${names[@]}"; then
+  msg OK "证书已签发：$ACME_LIVE/$domain"
+  echo '尚未部署，不影响当前节点。可选择 08 部署及 10 启用自动续期。'
+ else
+  if [[ $mode != http && ! -e $ACME_DIR/config/renewal/$domain.conf ]]; then rm -f -- "$cred"; fi
+  err '签发失败，请检查验证记录、端口或 API 权限'
+ fi
+}
+acme_select(){
+ local domain
+ domain=$(ask '证书名称（域名）' '') || return 1
+ domain=$(acme_domain "$domain") || return 1
+ [[ -s $ACME_LIVE/$domain/fullchain.pem && -s $ACME_LIVE/$domain/privkey.pem ]] || { err '证书不存在'; return 1; }
+ printf '%s' "$domain"
+}
+acme_pair_check(){
+ local c=$1 k=$2 a b
+ openssl x509 -in "$c" -noout -checkend 0 >/dev/null || return 1
+ a=$(openssl x509 -in "$c" -pubkey -noout) || return 1
+ b=$(openssl pkey -in "$k" -pubout) || return 1
+ [[ $a == "$b" ]] || { err '证书和私钥不匹配'; return 1; }
+}
+acme_deploy_pair() (
+ local c=$1 k=$2 domain=$3 mode=$4 w='' oldpin newpin active=0 old='' u g
+ [[ -s $C ]] || { err '请先初始化代理服务'; exit 1; }
+ need openssl jq flock || exit 1
+ install -d -m 700 "$ACME_DIR" || exit 1
+ exec 9>"$ACME_DIR/deploy.lock"; flock -n 9 || { err '证书部署正在进行'; exit 1; }
+ acme_pair_check "$c" "$k" || exit 1
+ # Only replace the shared pair already used by manager-created TLS inbounds.
+ jq -e 'any(.inbounds[]?;.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem" and .tls.key_path=="/etc/sing-box/cert/server.key")' "$C" >/dev/null || { err '没有使用共享证书路径的入站，拒绝部署'; exit 1; }
+ [[ -s $ACME_DEPLOY/fullchain.pem && -s $ACME_DEPLOY/server.key ]] || { err '共享证书不完整'; exit 1; }
+ oldpin=$(pin "$ACME_DEPLOY/fullchain.pem") || exit 1
+ newpin=$(pin "$c") || exit 1
+ if [[ $mode == auto && $oldpin != "$newpin" ]]; then err '自动部署拒绝变更 SPKI 指纹，请手动确认'; exit 1; fi
+ if [[ $mode != auto ]]; then
+  printf '旧 SPKI: %s\n新 SPKI: %s\n' "$oldpin" "$newpin"
+  jq -r '.inbounds[]?|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem")|[.tag,.tls.server_name]|@tsv' "$C"
+  echo '客户端须使用证书覆盖的 SNI；原有公钥固定客户端可能需要更新。'
+  confirm '备份并替换共享证书？不会自动修改客户端 SNI' || exit 0
+ fi
+ # Require existing SNI to match the new certificate, including wildcard matching.
+ while IFS= read -r u; do
+  [[ -n $u ]] || continue
+  openssl x509 -in "$c" -noout -checkhost "$u" | grep -q 'does match certificate' || { err "证书不覆盖现有 SNI：$u；请先调整节点 SNI"; exit 1; }
+ done < <(jq -r '.inbounds[]?|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem")|.tls.server_name//empty' "$C")
+ w=$(mktemp -d) || exit 1; trap 'rm -rf -- "$w"' EXIT
+ old=$(backup) || exit 1
+ cp -a "$ACME_DEPLOY/fullchain.pem" "$w/oldcert" && cp -a "$ACME_DEPLOY/server.key" "$w/oldkey" || exit 1
+ systemctl is-active --quiet sing-box && active=1
+ u=$(systemctl show sing-box -p User --value); u=${u:-root}
+ g=$(systemctl show sing-box -p Group --value); g=${g:-$(id -gn "$u")}
+ if install -o root -g "$g" -m 644 "$c" "$ACME_DEPLOY/fullchain.pem.new" &&
+    install -o root -g "$g" -m 640 "$k" "$ACME_DEPLOY/server.key.new" &&
+    mv -f "$ACME_DEPLOY/fullchain.pem.new" "$ACME_DEPLOY/fullchain.pem" &&
+    mv -f "$ACME_DEPLOY/server.key.new" "$ACME_DEPLOY/server.key" &&
+    sing-box check -C /etc/sing-box &&
+    { ((active==0)) || { systemctl restart sing-box && sleep 2 && systemctl is-active --quiet sing-box; }; }; then
+  if [[ $mode != auto ]]; then
+   if [[ -n $domain ]]; then printf '%s\n' "$domain" > "$ACME_HOOK"; else rm -f "$ACME_HOOK"; fi
+  fi
+  msg OK "证书已部署，备份：$old"; exit 0
+ fi
+ rm -f "$ACME_DEPLOY/fullchain.pem.new" "$ACME_DEPLOY/server.key.new"
+ cp -a "$w/oldcert" "$ACME_DEPLOY/fullchain.pem" && cp -a "$w/oldkey" "$ACME_DEPLOY/server.key" || { err "恢复失败，备份：$old"; exit 1; }
+ if ((active)); then systemctl restart sing-box || :; fi
+ err "证书部署失败，已尝试恢复，备份：$old"
+)
+acme_deploy(){
+ local d; d=$(acme_select) || return 1
+ acme_deploy_pair "$ACME_LIVE/$d/fullchain.pem" "$ACME_LIVE/$d/privkey.pem" "$d" manual
+}
+acme_import(){
+ local c k
+ c=$(ask '完整证书链文件路径' '') || return 1
+ k=$(ask '私钥文件路径' '') || return 1
+ [[ -f $c && -f $k ]] || return 1
+ acme_deploy_pair "$c" "$k" '' manual
+}
+acme_restore(){
+ local dir
+ ls -1d "$B"/* 2>/dev/null || :
+ dir=$(ask '备份目录完整路径' '') || return 1
+ [[ -s $dir/sing-box/cert/fullchain.pem && -s $dir/sing-box/cert/server.key ]] || { err '备份没有完整证书'; return 1; }
+ acme_deploy_pair "$dir/sing-box/cert/fullchain.pem" "$dir/sing-box/cert/server.key" '' manual
+}
+acme_auto_deploy(){
+ local d
+ [[ -s $ACME_HOOK ]] || return 0
+ IFS= read -r d < "$ACME_HOOK" || return 1
+ [[ $(acme_domain "$d") == "$d" ]] || return 1
+ # Do not restart if deployed files are unchanged.
+ if cmp -s "$ACME_LIVE/$d/fullchain.pem" "$ACME_DEPLOY/fullchain.pem" && cmp -s "$ACME_LIVE/$d/privkey.pem" "$ACME_DEPLOY/server.key"; then return 0; fi
+ acme_deploy_pair "$ACME_LIVE/$d/fullchain.pem" "$ACME_LIVE/$d/privkey.pem" "$d" auto
+}
+acme_renew(){
+ need certbot || return 1
+ acme_cmd renew --non-interactive || return 1
+ acme_auto_deploy
+}
+acme_timer(){
+ local op
+ op=$(ask '自动续期 enable/disable/status' status) || return 1
+ case $op in
+ enable)
+  [[ -x /usr/local/bin/sb ]] || { err '请先安装管理器'; return 1; }
+  need certbot || return 1
+  confirm '启用独立自动续期定时器（每日两次）?' || return 0
+  cat > /etc/systemd/system/sb-cert-renew.service <<'UNIT'
+[Unit]
+Description=sb-manager ACME renewal
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sb cert-renew
+UNIT
+  cat > /etc/systemd/system/sb-cert-renew.timer <<'UNIT'
+[Unit]
+Description=sb-manager ACME renewal timer
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload && systemctl enable --now sb-cert-renew.timer;;
+ disable) systemctl disable --now sb-cert-renew.timer;;
+ status) systemctl list-timers --all sb-cert-renew.timer; systemctl status sb-cert-renew.timer --no-pager || :;;
+ *) err '无效选项';;
+ esac
+}
+acme_info(){
+ local c=$ACME_DEPLOY/fullchain.pem
+ [[ -s $c ]] && openssl x509 -in "$c" -noout -subject -issuer -dates -ext subjectAltName
+ if command -v certbot >/dev/null; then acme_cmd certificates; fi
+}
+acme_expiry(){
+ local c
+ for c in "$ACME_DEPLOY/fullchain.pem" "$ACME_LIVE"/*/fullchain.pem; do
+  [[ -s $c ]] || continue
+  printf '%s: ' "$c"; openssl x509 -in "$c" -noout -enddate
+  openssl x509 -in "$c" -noout -checkend 2592000 || :
+ done
+}
+acme_verify(){
+ local d p
+ d=$(ask 'TLS 域名' '') || return 1; d=$(acme_domain "$d") || return 1
+ p=$(ask 'TCP 端口' 443) || return 1; port "$p" || return 1
+ timeout 15 openssl s_client -connect "$d:$p" -servername "$d" -verify_hostname "$d" -verify_return_error -brief </dev/null
+}
+acme_delete(){
+ local d
+ d=$(acme_select) || return 1
+ if [[ -s $ACME_HOOK ]] && grep -Fxq "$d" "$ACME_HOOK"; then err '证书仍绑定自动部署，先部署其他证书或恢复原始证书'; return 1; fi
+ confirm "删除 ACME 证书 $d（不撤销、不删除已部署副本）?" || return 0
+ acme_cmd delete --cert-name "$d" --non-interactive && rm -f -- "$ACME_DIR/$d.cloudflare.ini"
+}
+acme_menu(){
+ local n
+ while true; do
+ ui_title 'TLS 证书管理'
+ columns '01 安装 ACME 工具|02 HTTP-01 域名签发|03 Cloudflare DNS 签发|04 通配符证书签发|05 导入已有证书|06 查看证书信息|07 查看证书有效期' '08 部署证书至节点|09 手动续期证书|10 自动续期管理|11 证书公钥指纹|12 TCP TLS 连接验证|13 恢复备份证书|14 删除 ACME 证书'
+ echo '00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in
+  1|01) acme_install;; 2|02) acme_issue http;; 3|03) acme_issue dns;; 4|04) acme_issue wildcard;; 5|05) acme_import;; 6|06) acme_info;; 7|07) acme_expiry;;
+  8|08) acme_deploy;; 9|09) acme_renew;; 10) acme_timer;; 11) pin "$ACME_DEPLOY/fullchain.pem"; echo;; 12) acme_verify;; 13) acme_restore;; 14) acme_delete;; 0|00) return;; *) err '无效选项';;
+ esac
+ done
+}
 manager_status(){
  local st core final mode
  printf '系统：%s | 架构：%s | 虚拟化：%s\n' "$(env_os)" "$(env_arch)" "$(virt)"
@@ -1863,7 +2085,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器|' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
+ columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器|38 TLS 证书管理' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -1885,6 +2107,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert) acme_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
