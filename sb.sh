@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.7
+VERSION=2.2.8
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -27,7 +27,7 @@ install_core(){
  local f; f=$(mktemp); curl -fsSL https://sing-box.app/install.sh -o "$f" && bash "$f"; local rc=$?; rm -f "$f"; ((rc==0)) || return "$rc"
  sing-box version; systemctl enable sing-box
 }
-backup(){ mkdir -p "$B"; local f; f=$(mktemp -d "$B/$(date +%Y%m%d-%H%M%S).XXXXXX") || return 1; cp -a /etc/sing-box "$f/" || return 1; printf '%s\n' "$f"; }
+backup(){ mkdir -p "$B"; local f; f=$(mktemp -d "$B/$(date +%Y%m%d-%H%M%S).XXXXXX") || return 1; cp -a /etc/sing-box "$f/" || return 1; if [[ -f $POLICY ]]; then cp -a "$POLICY" "$f/sb-policy.json" || return 1; fi; printf '%s\n' "$f"; }
 check(){ sing-box check -c "$1"; }
 permissions(){
  local u g; u=$(systemctl show sing-box -p User --value); u=${u:-root}; g=$(systemctl show sing-box -p Group --value); g=${g:-$(id -gn "$u")}
@@ -36,10 +36,10 @@ permissions(){
  if [[ -d /etc/sing-box/cert ]]; then chown root:"$g" /etc/sing-box/cert; chmod 750 /etc/sing-box/cert; find /etc/sing-box/cert -maxdepth 1 -type f \( -name '*.key' -o -name 'privkey.pem' \) -exec chown root:"$g" {} + -exec chmod 640 {} +; find /etc/sing-box/cert -maxdepth 1 -type f -name fullchain.pem -exec chmod 644 {} +; fi
 }
 apply(){
- local new=$1 old='' stage was=0; check "$new" || return 1; systemctl is-active --quiet sing-box && was=1
+ local new=$1 old='' stage was=0; policy_migrate || return 1; check "$new" || return 1; systemctl is-active --quiet sing-box && was=1
  if [[ -f $C ]]; then old=$(backup) || return 1; fi
  mkdir -p /etc/sing-box; stage=$(mktemp /etc/sing-box/.config.XXXXXX) || return 1; cp "$new" "$stage" && mv "$stage" "$C" || return 1
- if permissions && systemctl restart sing-box && sleep 2 && systemctl is-active --quiet sing-box; then msg OK "配置已应用，备份 ${old:-无（首次安装）}"; return 0; fi
+ if permissions && sing-box check -C /etc/sing-box && systemctl restart sing-box && sleep 2 && systemctl is-active --quiet sing-box; then msg OK "配置已应用，备份 ${old:-无（首次安装）}"; return 0; fi
  journalctl -u sing-box -n 25 --no-pager; if [[ -n $old ]]; then cp -a "$old/sing-box/config.json" "$C"; else rm -f "$C"; fi
  if ((was)); then systemctl restart sing-box || :; else systemctl stop sing-box || :; fi; err '应用失败，已尝试回滚'
 }
@@ -491,8 +491,25 @@ proxy_import() (
 )
 proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
-POLICY=/etc/sing-box/sb-policy.json
-policy_ready(){ if [[ ! -e $POLICY ]]; then printf '{"disabled":[],"saved":null}\n' > "$POLICY"; fi; jq -e 'type=="object" and (.disabled|type=="array")' "$POLICY" >/dev/null; }
+POLICY=/var/lib/sb-manager/sb-policy.json
+policy_migrate(){
+ local old=/etc/sing-box/sb-policy.json
+ [[ -e $old ]] || return 0
+ install -d -m 700 /var/lib/sb-manager || return 1
+ if [[ -e $POLICY ]]; then
+  if cmp -s "$old" "$POLICY"; then
+   rm -- "$old" || return 1
+  else
+   err "新旧策略文件内容不同；请先备份并手动处理 $old 与 $POLICY，拒绝覆盖"
+   return 1
+  fi
+ else
+  mv -- "$old" "$POLICY" || return 1
+ fi
+ chmod 600 "$POLICY" || return 1
+ msg OK "旧策略文件已迁移至 $POLICY（未重启服务）"
+}
+policy_ready(){ policy_migrate || return 1; install -d -m 700 "${POLICY%/*}" || return 1; if [[ ! -e $POLICY ]]; then printf '{"disabled":[],"saved":null}\n' > "$POLICY"; fi; jq -e 'type=="object" and (.disabled|type=="array")' "$POLICY" >/dev/null; }
 policy_edit(){ local f; f=$(mktemp "${POLICY%/*}/.policy.XXXXXX") || return 1; if jq "$@" "$POLICY" > "$f"; then mv "$f" "$POLICY"; else rm -f "$f"; return 1; fi; }
 policy_normal(){ policy_ready && jq -e '.saved==null' "$POLICY" >/dev/null || { err '请先切回智能分流模式'; return 1; }; }
 rule_toggle(){ local i r; policy_normal || return 1; route_list; jq -r '.disabled|to_entries[]|"禁用索引 \(.key): \(.value.rule|tojson)"' "$POLICY"; local action; action=$(ask 'disable/enable' disable) || return 1; i=$(ask '规则索引' '') || return 1; [[ $i =~ ^(0|[1-9][0-9]{0,6})$ ]] || return 1; if [[ $action == disable ]]; then route_index "$i" || return 1; r=$(jq -c --argjson i "$i" '.route.rules[$i]' "$C") || return 1; jq -e '(.action=="sniff" or .action=="resolve" or .ip_is_private==true)|not' <<< "$r" >/dev/null || { err '基础规则不可禁用'; return 1; }; confirm '禁用规则?' || return 0; policy_edit --argjson r "$r" --argjson i "$i" '.disabled += [{rule:$r,index:$i}]' || return 1; if ! edit --argjson i "$i" 'del(.route.rules[$i])'; then policy_edit '.disabled |= .[:-1]'; return 1; fi; elif [[ $action == enable ]]; then r=$(jq -ce --argjson i "$i" '.disabled[$i]' "$POLICY") || return 1; confirm '恢复规则（请检查优先级）?' || return 0; edit --argjson r "$r" '.route.rules |= (.[:$r.index]+[$r.rule]+.[$r.index:])' && policy_edit --argjson i "$i" 'del(.disabled[$i])'; fi; }
@@ -665,4 +682,4 @@ menu(){ local n; while true; do
 
 dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; dispatch "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
