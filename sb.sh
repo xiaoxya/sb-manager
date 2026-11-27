@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.1
+VERSION=2.2.2
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -125,7 +125,7 @@ info(){
  local k; k=$(jq -r '.inbounds[]|.tls.reality.private_key // empty' "$C"); [[ -z $k ]] || { printf 'REALITY PublicKey: '; public_key "$k"; }
  if [[ $h != '未设置公网地址' ]]; then
  python3 - "$C" "$h" <<'PYLINK'
-import json,sys,urllib.parse as u,base64
+import json,sys,urllib.parse as u,base64,subprocess
 c=json.load(open(sys.argv[1])); h=sys.argv[2]; h=f'[{h}]' if ':' in h and not h.startswith('[') else h
 for i in c['inbounds']:
  t=i['type']; p=i.get('listen_port'); tls=i.get('tls',{}); s=tls.get('server_name','')
@@ -133,6 +133,29 @@ for i in c['inbounds']:
   for user in i.get('users',[]):
    if user.get('name') in ('hk-relay','relay-client'): continue
    print(f"{t}://{u.quote(user['password'],safe='')}@{h}:{p}?{u.urlencode({'sni':s,'insecure':1})}#{i['tag']}")
+ elif t=='vless' and tls.get('reality',{}).get('enabled'):
+  reality=tls['reality']
+  try:
+   key=reality['private_key']
+   raw=base64.urlsafe_b64decode(key+'='*(-len(key)%4))
+   if len(raw)!=32: raise ValueError('invalid X25519 key length')
+   der=subprocess.check_output(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],input=bytes.fromhex('302e020100300506032b656e04220420')+raw,stderr=subprocess.DEVNULL)
+   pub=base64.urlsafe_b64encode(der[-32:]).decode().rstrip('=')
+  except (KeyError,ValueError,OSError,subprocess.CalledProcessError):
+   print('警告：无法计算 REALITY 公钥，跳过 VLESS 分享链接',file=sys.stderr)
+   continue
+  transport=i.get('transport') or {}
+  if transport.get('type','tcp')!='tcp':
+   print('警告：非 TCP REALITY 入站暂不生成分享链接',file=sys.stderr)
+   continue
+  ids=reality.get('short_id') or ['']
+  for user in i.get('users',[]):
+   uuid=user.get('uuid')
+   if not uuid: continue
+   q={'encryption':'none','security':'reality','sni':s or reality.get('handshake',{}).get('server',''),'fp':'chrome','pbk':pub,'sid':ids[0],'type':'tcp'}
+   if user.get('flow'): q['flow']=user['flow']
+   name=i.get('tag','vless-reality')+'-'+(user.get('name') or 'client')
+   print(f"vless://{u.quote(uuid,safe='')}@{h}:{p}?{u.urlencode(q)}#{u.quote(name,safe='')}")
  elif t=='shadowsocks':
   auth=base64.urlsafe_b64encode((i['method']+':'+i['password']).encode()).decode().rstrip('=')
   print(f"ss://{auth}@{h}:{p}#{i['tag']}")
