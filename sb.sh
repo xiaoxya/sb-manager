@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.8
+VERSION=2.2.9
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -263,7 +263,6 @@ for i in c['inbounds']:
 PYLINK
  echo '自签链接中的 insecure=1 仅为兼容部分客户端；优先手动设置上面的公钥指纹。'
  fi
- jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="snell")|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C"
 }
 reality_test() ( local w key pub; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; key=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") || exit 1; pub=$(public_key "$key") || exit 1; jq --arg pub "$pub" '.inbounds[]|select(.tag=="vless-reality-in")|{type:"vless",tag:"reality-test",server:"127.0.0.1",server_port:.listen_port,uuid:.users[0].uuid,flow:.users[0].flow,tls:{enabled:true,server_name:.tls.server_name,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:.tls.reality.short_id[0]}}}' "$C" > "$w/o" && probe "$w/o"; )
 fix_rules(){ local f; f=$(mktemp); rules > "$f"; edit --slurpfile r "$f" '.http_clients=((.http_clients // [])|map(select(.tag!="rule-download")))+$r[0].http_clients|.route.default_http_client="rule-download"|.route.rule_set |= map(if .type=="remote" and (.http_client == null or .http_client == "rule-download") then del(.download_detour,.http_client) else . end)'; local rc=$?; rm -f "$f"; return "$rc"; }
@@ -489,7 +488,90 @@ proxy_import() (
  jq -e --arg t "$t" 'any(.outbounds[];.tag==$t)' "$C" >/dev/null && { err '标签已存在'; exit 1; }
  edit --slurpfile o "$w/o" '.outbounds += $o'
 )
-proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 0|00) return;; esac; done; }
+# Export native JSON without losing protocol-specific settings. Never overwrite a file.
+proxy_export() (
+ local scope tag path w
+ [[ -s $C ]] || { err '请先安装服务'; exit 1; }
+ need jq || exit 1
+ scope=$(ask '导出范围 single/all' single) || exit 1
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ case $scope in
+ single)
+  proxy_list
+  tag=$(ask '出站标签' '') || exit 1
+  jq -e --arg t "$tag" '[.outbounds[]|select(.tag==$t)]|select(length==1)|{outbounds:.}' "$C" > "$w/export.json" || { err '出站不存在或标签不唯一'; exit 1; };;
+ all) jq -e '{outbounds:.outbounds}|select(.outbounds|type=="array")' "$C" > "$w/export.json" || exit 1;;
+ *) err '无效范围'; exit 1;;
+ esac
+ echo 'JSON 包含完整认证信息（密码、UUID、PSK 等），请勿公开。'
+ path=$(ask '导出路径' "/root/sb-outbounds-$(date +%Y%m%d-%H%M%S).json") || exit 1
+ [[ -n $path && ! -e $path && ! -L $path ]] || { err '目标已存在或路径无效'; exit 1; }
+ confirm '确认导出敏感配置到文件?' || exit 0
+ (umask 077; set -C; cat "$w/export.json" > "$path") || { err '无法创建导出文件'; exit 1; }
+ chmod 600 "$path" || exit 1
+ msg OK "已导出：$path"
+)
+show_help(){
+ cat <<HELP
+sing-box Manager v$VERSION
+用法：sb [命令] [参数]
+      sb [菜单编号]
+      sb -h | --help
+      sb -v | --version
+
+不带参数：打开交互式菜单。
+除帮助和版本查询外，管理命令需要 root 权限。
+
+安装及更新
+  install-manager        安装当前脚本到 /usr/local/bin/sb
+  self-update            从 GitHub 更新管理器（不更新核心）
+  update                 安装/更新 sing-box 核心
+  init / install-service / inbounds
+                         安装服务及入站管理菜单
+  init-standalone        独立代理初始化
+  init-entry             入口初始化（旧别名 init-hk）
+  init-landing           落地初始化（旧别名 init-tw）
+  add-inbound [协议]     添加入站（交互选择）
+  delete-inbound         删除指定入站
+  add-snell              Snell 入站快捷入口
+  注意：已有服务不要直接执行初始化命令。
+
+服务及节点
+  start | stop | restart | status
+                         启动、停止、重启、查看状态
+  logs                   实时服务日志
+  info                   仅查看入站信息及客户端链接
+  port                   修改入站监听端口
+  outbounds              出站管理菜单
+  change-relay           修改中转出站
+  import-node            导入分享链接（别名 import-outbound）
+  export-outbound        导出单个或全部出站 JSON（含认证信息）
+  relay [出口IP]         测试中转
+  test-outbound 标签 [出口IP]
+                         测试指定出站
+  test                   REALITY 本机测试
+
+分流及维护
+  rules                  分流规则管理
+  test-route             域名分流测试
+  fix-rules              修复规则下载
+  monitor                实时日志筛选
+  diagnose               综合诊断
+  fix-perm               修复文件权限
+  backup | restore       备份 / 恢复配置 JSON
+  disk | clean           磁盘检查 / 清理
+  bbr                    BBR 管理
+  01-35                  对应主菜单编号
+  部分维护功能仅提供数字菜单入口。
+
+示例：
+  sb add-inbound snell
+  sb test-outbound relay-jp
+  sb export-outbound
+  sb self-update
+HELP
+}
+proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|09 导出出站节点|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 9|09) proxy_export;; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
 POLICY=/var/lib/sb-manager/sb-policy.json
 policy_migrate(){
@@ -680,6 +762,6 @@ menu(){ local n; while true; do
  dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
