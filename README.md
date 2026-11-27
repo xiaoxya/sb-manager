@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.11** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.13** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -355,3 +355,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 `sb env` 查看操作系统、AMD64/ARM64 架构、内核、虚拟化、systemd、软件依赖、内存磁盘及 BBR 状态。核心安装前执行 Debian/Ubuntu、软件包架构及 systemd 检查。主菜单显示系统及 Argo 状态。
 
 主菜单 36 或 `sb argo` 管理 Cloudflare 固定隧道。需要在 Cloudflare 控制台预先创建 remotely-managed Tunnel、获取 connector token，并添加公网 hostname 路由到 HTTP `http://127.0.0.1:18080`（或自行选择的本地端口）。脚本通过官方 APT 仓库安装 cloudflared，创建独立 VLESS WS 回环入站、随机 UUID、WS 路径及 `sb-argo.service`，令牌保存在 `/etc/sb-argo/token`（600）。菜单可查看链接、启停、日志及删除本地配置。删除不会删除云端隧道。普通 HTTP Tunnel 不承载 REALITY、HY2、AnyTLS、Snell 或 SS 原生协议。本版不含临时 Quick Tunnel、云端 DNS 自动创建或 WS 出站分享链接导入。应用入站会重启 sing-box；连接器启动失败时可能保留已添加入站，需检查日志或删除。尚未进行 ARM64/Argo 实机验证。
+
+## v2.2.13 管理器自动重载
+
+主菜单 35 更新成功后由父进程执行 exec 自动加载新版，无需退出再运行 sb。交互式 `sb self-update` 同样自动打开新版菜单；非交互环境成功后正常返回。下载、版本标识、Bash 语法、暂存及备份检查通过后才使用同目录原子替换，取消或失败保留原文件。磁盘已有新版而当前运行版本较旧时直接重载。首次从旧版升级到 v2.2.13 仍可能需要手动退出重开一次，因为旧版尚未具备重载逻辑。不修改 sing-box 核心或代理配置，不重启服务。
