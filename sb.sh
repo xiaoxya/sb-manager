@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.29
+VERSION=2.2.30
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -640,13 +640,28 @@ set_public_address(){
  msg OK "公网连接地址已设置为 $h"
 }
 init_role() (
- local role=$1 w host sni hp ap rp ssport hy any relaypw sskey reality keys priv pub uuid sid; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
+ w=''
+ local role=$1 host sni hp ap rp ssport hy any relaypw sskey reality keys priv pub uuid sid answer existing=0 saved='' old_sni='' argo_port=''; w=$(mktemp -d) || exit 1; trap '[[ -z ${w:-} ]] || rm -rf -- "$w"' EXIT
  need sing-box jq openssl python3 || exit 1
- if [[ -f $C ]]; then confirm '已有配置，重新初始化将替换入站及密码，确认?' || exit 0; fi
+ if [[ -e $C ]]; then
+  existing=1
+  echo '警告：重新初始化将重新生成节点密码、UUID 和 REALITY 密钥，替换原有非 Argo 入站、出站及分流/DNS 配置。旧客户端可能失效。'
+  echo '现有证书和 Argo 专用入站保留；如需仅添加或删除节点，请返回使用 05/06。'
+  read -rp '确认重新初始化请输入 REINIT：' answer || exit 1
+  [[ $answer == REINIT ]] || { echo '已取消，未修改配置'; exit 0; }
+  saved=$(backup) || { err '备份失败，拒绝重新初始化'; exit 1; }
+  printf '原始配置及证书备份：%s\n' "$saved"
+  jq -e 'type=="object" and (.inbounds|type=="array")' "$C" >/dev/null || { err '旧配置无法解析，请先修复'; exit 1; }
+  jq '[.inbounds[]|select(.tag=="argo-vless-in")]' "$C" > "$w/argo" || exit 1
+  if [[ -e $ARGO_UNIT ]] && ! jq -e 'length==1' "$w/argo" >/dev/null; then err 'Argo 服务存在但专用入站不完整，请先修复 Argo'; exit 1; fi
+  old_sni=$(jq -r '[.inbounds[]|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem")|.tls.server_name//empty][0]//empty' "$C")
+ else echo '[]' > "$w/argo"; fi
  host=$(public_address_prompt) || exit 1
  if [[ $role != landing ]]; then hp=443; ap=59007; else hp=21196; ap=59007; fi
  hp=$(ask 'HY2 UDP 监听端口' "$hp"); ap=$(ask 'AnyTLS TCP 监听端口' "$ap"); port "$hp" && port "$ap" || exit 1; hp=$((10#$hp)); ap=$((10#$ap))
- sni=$(ask '自签证书 SNI' "$role-proxy.example.com"); [[ $sni =~ ^[A-Za-z0-9.-]+$ ]] || exit 1; cert "$sni" || exit 1
+ sni=$(ask '证书 SNI（已有证书请使用其覆盖的域名）' "${old_sni:-$role-proxy.example.com}") || exit 1
+ [[ $sni =~ ^[A-Za-z0-9.-]+$ ]] || exit 1; cert "$sni" || exit 1
+ openssl x509 -in /etc/sing-box/cert/fullchain.pem -noout -checkhost "$sni" | grep -q 'does match certificate' || { err '现有证书不覆盖该 SNI，请使用原证书域名或通过 38 管理证书'; exit 1; }
  hy=$(openssl rand -hex 24); any=$(openssl rand -hex 24); relaypw=$(openssl rand -hex 24)
  jq -n --arg s "$sni" --arg h "$hy" --arg a "$any" --arg r "$relaypw" --arg role "$role" --argjson hp "$hp" --argjson ap "$ap" '{log:{level:"info",timestamp:true},dns:{servers:[{type:"local",tag:"local-dns"}],final:"local-dns"},inbounds:[{type:"hysteria2",tag:"hy2-in",listen:"0.0.0.0",listen_port:$hp,users:[{name:"client",password:$h}],tls:{enabled:true,server_name:$s,certificate_path:"/etc/sing-box/cert/fullchain.pem",key_path:"/etc/sing-box/cert/server.key"}},{type:"anytls",tag:"anytls-in",listen:"0.0.0.0",listen_port:$ap,users:([{name:"client",password:$a}]+(if $role=="landing" then [{name:"relay-client",password:$r}] else [] end)),tls:{enabled:true,server_name:$s,certificate_path:"/etc/sing-box/cert/fullchain.pem",key_path:"/etc/sing-box/cert/server.key"}}],outbounds:[{type:"direct",tag:"direct"}],route:{default_domain_resolver:"local-dns",rules:[{action:"sniff"},{ip_is_private:true,action:"reject"},{action:"resolve"},{ip_is_private:true,action:"reject"}],final:"direct"},experimental:{cache_file:{enabled:true,path:"/var/lib/sing-box/cache.db"}}}' > "$w/base" || exit 1
  if [[ $role != landing ]]; then
@@ -666,7 +681,13 @@ init_role() (
    fi
  done
  if confirm '额外启用 Snell 入站?'; then snell_inbound "$w/final" "$w/next" && mv "$w/next" "$w/final" || exit 1; fi
+ jq --slurpfile a "$w/argo" '.inbounds += $a[0]' "$w/final" > "$w/next" && mv "$w/next" "$w/final" || exit 1
  jq -e '.inbounds|length>0' "$w/final" >/dev/null || { err '至少启用一个入站'; exit 1; }
+ if ((existing)); then
+  echo '即将应用的新入站（不显示密码）：'
+  jq -r '.inbounds[]|[.tag,.type,.listen_port]|@tsv' "$w/final"
+  confirm '最终确认：替换现有配置并重启 sing-box？' || { echo '已取消，保留旧配置'; exit 0; }
+ fi
  apply "$w/final" || exit 1; rm -f "$POLICY"; printf '%s\n' "$host" > "$META"; systemctl enable sing-box; info
 )
 info(){
@@ -1287,7 +1308,7 @@ sing-box Manager v$VERSION
   add-inbound [协议]     添加入站（交互选择）
   delete-inbound         删除指定入站
   add-snell              Snell 入站快捷入口
-  注意：已有服务不要直接执行初始化命令。
+  注意：已有服务重新初始化需输入 REINIT 并最终确认，旧节点凭据及分流可能失效。
 
 服务及节点
   start | stop | restart | status
@@ -1428,11 +1449,10 @@ service_menu(){
  local n
  while true; do
   ui_title '安装服务 / 入站管理'
-  columns '01 独立代理（首次安装）|02 入口中转（首次安装）|03 落地服务（首次安装）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|00 返回'
+  columns '01 独立代理（初始化）|02 入口中转（初始化）|03 落地服务（初始化）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|00 返回'
   read -rp "$(ui_prompt '请选择操作：')" n || return
   case $n in
    1|01|2|02|3|03)
-    if [[ -s $C ]] && jq -e '(.inbounds // [])|length>0' "$C" >/dev/null 2>&1; then err '已有入站，请使用05/06；拒绝重新初始化以保护节点'; continue; fi
     case $n in 1|01) init_role standalone;; 2|02) init_role entry;; *) init_role landing;; esac;;
    4|04) [[ -s $C ]] && inbound_list;;
    5|05) inbound_add;;
