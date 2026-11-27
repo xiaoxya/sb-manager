@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.13
+VERSION=2.2.14
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -310,11 +310,65 @@ legacy_change_relay() (
  local w expected tag; tag=$(relay_tag) || { err "未配置中转出站"; exit 1; }; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; jq -e --arg tag "$tag" '.outbounds[]|select(.tag==$tag)' "$C" > "$w/old" || exit 1; make_relay "$w/new" "$w/old" || exit 1; jq --slurpfile old "$w/old" '.tag=$old[0].tag' "$w/new" > "$w/tagged" && mv "$w/tagged" "$w/new" || exit 1; expected=$(ask '预期落地出口IP（必填）' ''); [[ -n $expected ]] || exit 1; probe "$w/new" "$expected" || exit 1; confirm '测试成功，应用配置?' || exit 0; edit --slurpfile o "$w/new" '(.outbounds[]|select(.tag==$o[0].tag))=$o[0]'
 )
 legacy_relay() ( local w tag; tag=$(relay_tag) || { err "未配置中转出站"; exit 1; }; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; jq -e --arg tag "$tag" '.outbounds[]|select(.tag==$tag)' "$C" > "$w/o" && probe "$w/o" "${1:-}"; )
+# Detect the VPS egress IP directly, without using shell proxy variables.
+detect_public_ip(){
+ local family url ip
+ command -v curl >/dev/null && command -v python3 >/dev/null || return 1
+ for family in 4 6; do
+  if [[ $family == 4 ]]; then
+   local -a urls=(https://api.ipify.org https://ipv4.icanhazip.com)
+  else
+   local -a urls=(https://api6.ipify.org https://ipv6.icanhazip.com)
+  fi
+  for url in "${urls[@]}"; do
+   ip=$(curl -"$family" --noproxy '*' -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null) || continue
+   ip=$(printf '%s' "$ip" | python3 -c 'import sys,ipaddress
+try:
+ a=ipaddress.ip_address(sys.stdin.read().strip())
+ assert a.is_global and not a.is_multicast
+ print(a)
+except (ValueError,AssertionError): sys.exit(1)') || continue
+   printf '%s\n' "$ip"; return 0
+  done
+ done
+ return 1
+}
+public_address_prompt(){
+ local saved='' detected='' default='' h
+ if [[ -s $META ]]; then IFS= read -r saved < "$META" || :; fi
+ printf '正在检测 VPS 公网出口 IP（优先 IPv4）...\n' >&2
+ detected=$(detect_public_ip) || :
+ if [[ -n $detected ]]; then printf '检测到公网出口 IP：%s\n' "$detected" >&2; else printf '公网 IP 检测失败，可手动填写。\n' >&2; fi
+ if [[ -n $saved ]]; then
+  default=$saved
+  printf '保留已保存的连接地址：%s；输入 auto 使用本次检测结果。\n' "$saved" >&2
+ else default=$detected; fi
+ printf '注意：NAT VPS 的出口 IP 不一定等于入站连接地址。\n' >&2
+ h=$(ask '本机对外连接地址（公网IP/域名，auto 自动获取）' "$default") || return 1
+ if [[ $h == auto ]]; then h=$detected; fi
+ [[ -n $h ]] || { err '无法获取公网地址，请手动填写'; return 1; }
+ h=$(printf '%s' "$h" | python3 -c 'import sys,ipaddress,re
+s=sys.stdin.read().strip()
+if s.startswith("[") and s.endswith("]"): s=s[1:-1]
+try:
+ print(ipaddress.ip_address(s))
+except ValueError:
+ if len(s)>253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",p) for p in s.rstrip(".").split(".")) or "." not in s or re.fullmatch(r"[0-9.]+",s): sys.exit(1)
+ print(s.rstrip("."))') || { err '公网地址格式无效'; return 1; }
+ printf '%s\n' "$h"
+}
+set_public_address(){
+ local h
+ h=$(public_address_prompt) || return 1
+ mkdir -p "$(dirname "$META")" || return 1
+ printf '%s\n' "$h" > "$META" || return 1
+ msg OK "公网连接地址已设置为 $h"
+}
 init_role() (
  local role=$1 w host sni hp ap rp ssport hy any relaypw sskey reality keys priv pub uuid sid; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
  need sing-box jq openssl python3 || exit 1
  if [[ -f $C ]]; then confirm '已有配置，重新初始化将替换入站及密码，确认?' || exit 0; fi
- host=$(ask '本机对外连接地址（公网IP/域名）' ''); [[ -n $host ]] || exit 1
+ host=$(public_address_prompt) || exit 1
  if [[ $role != landing ]]; then hp=443; ap=59007; else hp=21196; ap=59007; fi
  hp=$(ask 'HY2 UDP 监听端口' "$hp"); ap=$(ask 'AnyTLS TCP 监听端口' "$ap"); port "$hp" && port "$ap" || exit 1; hp=$((10#$hp)); ap=$((10#$ap))
  sni=$(ask '自签证书 SNI' "$role-proxy.example.com"); [[ $sni =~ ^[A-Za-z0-9.-]+$ ]] || exit 1; cert "$sni" || exit 1
@@ -450,7 +504,7 @@ legacy_menu(){ while true; do cat <<MENU
 MENU
  local n; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 0) return;; *) dispatch "$n";; esac; read -rp '回车继续...' _ || return; done; }
 legacy_dispatch(){ case ${1:-} in
-1|update) install_core;; 2|02|init) init_menu;; init-entry|init-hk) init_role entry;; init-landing|init-tw) init_role landing;; 28|rules) route_manage;; 3|start) systemctl start sing-box;; 4|stop) systemctl stop sing-box;; 5|restart) systemctl restart sing-box;; 6|status) systemctl status sing-box --no-pager -l;; 7|logs) journalctl -u sing-box -n 30 -f -o cat;; 8|info) info;; 9|port) change_port;; 10|change-relay) change_relay;; 11|fix-rules) fix_rules;; 12|relay) relay "${2:-}";; 13) local l; l=$(ask '日志级别' info); edit --arg l "$l" '.log.level=$l';; 14|test) reality_test;; 15) local k; k=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") && public_key "$k";; 16) tls_target;; 17) ntp;; 18|diagnose) diagnose;; 19) foreground;; 20|fix-perm) permissions;; 21|backup) backup;; 22|restore) restore;; 23|disk) disk;; 24|clean) clean;; 25) limit_logs;; 26) sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control net.core.default_qdisc;; 27) local a; a=$(ask 'enable/disable' enable); case $a in enable|disable) systemctl "$a" sing-box;; esac;; 29|test-route) route_test;; 30|monitor) monitor;; 31) local period; period=$(ask '统计时间（1 hour/24 hours）' '1 hour'); journalctl -u sing-box --since "$period ago" -o cat --no-pager | sed -n 's/.*inbound connection to //p' | sort | uniq -c | sort -nr | head -50;; 32) local p; p=$(jq -r '.inbounds[]|select(.tag=="anytls-in")|.listen_port' "$C"); watch -n 1 "ss -tinp 'sport = :$p'";; 33) command -v nload >/dev/null || apt-get install -y nload; nload;; 34) local h; h=$(ask '公网地址' ''); [[ -n $h ]] && printf '%s\n' "$h" > "$META";; install-manager) if [[ $(readlink -f "$0") == /usr/local/bin/sb ]]; then return 0; fi; if [[ -e /usr/local/bin/sb ]]; then confirm "备份并替换旧 sb?" || return 0; cp -a /usr/local/bin/sb "/usr/local/bin/sb.bak.$(date +%s)" || return 1; fi; install -m 755 "$0" /usr/local/bin/sb;; '') menu;; *) err '未知命令';; esac; }
+1|update) install_core;; 2|02|init) init_menu;; init-entry|init-hk) init_role entry;; init-landing|init-tw) init_role landing;; 28|rules) route_manage;; 3|start) systemctl start sing-box;; 4|stop) systemctl stop sing-box;; 5|restart) systemctl restart sing-box;; 6|status) systemctl status sing-box --no-pager -l;; 7|logs) journalctl -u sing-box -n 30 -f -o cat;; 8|info) info;; 9|port) change_port;; 10|change-relay) change_relay;; 11|fix-rules) fix_rules;; 12|relay) relay "${2:-}";; 13) local l; l=$(ask '日志级别' info); edit --arg l "$l" '.log.level=$l';; 14|test) reality_test;; 15) local k; k=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") && public_key "$k";; 16) tls_target;; 17) ntp;; 18|diagnose) diagnose;; 19) foreground;; 20|fix-perm) permissions;; 21|backup) backup;; 22|restore) restore;; 23|disk) disk;; 24|clean) clean;; 25) limit_logs;; 26) sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control net.core.default_qdisc;; 27) local a; a=$(ask 'enable/disable' enable); case $a in enable|disable) systemctl "$a" sing-box;; esac;; 29|test-route) route_test;; 30|monitor) monitor;; 31) local period; period=$(ask '统计时间（1 hour/24 hours）' '1 hour'); journalctl -u sing-box --since "$period ago" -o cat --no-pager | sed -n 's/.*inbound connection to //p' | sort | uniq -c | sort -nr | head -50;; 32) local p; p=$(jq -r '.inbounds[]|select(.tag=="anytls-in")|.listen_port' "$C"); watch -n 1 "ss -tinp 'sport = :$p'";; 33) command -v nload >/dev/null || apt-get install -y nload; nload;; 34|public-address) set_public_address;; install-manager) if [[ $(readlink -f "$0") == /usr/local/bin/sb ]]; then return 0; fi; if [[ -e /usr/local/bin/sb ]]; then confirm "备份并替换旧 sb?" || return 0; cp -a /usr/local/bin/sb "/usr/local/bin/sb.bak.$(date +%s)" || return 1; fi; install -m 755 "$0" /usr/local/bin/sb;; '') menu;; *) err '未知命令';; esac; }
 # v2.2: use screen-cell width rather than byte width for Chinese menus.
 columns(){
  local width color=0; width=$(tput cols 2>/dev/null || echo 80); [[ $width =~ ^[0-9]+$ ]] || width=80; ui_color && color=1
@@ -780,6 +834,7 @@ sing-box Manager v$VERSION
   backup | restore       备份 / 恢复配置 JSON
   disk | clean           磁盘检查 / 清理
   bbr                    BBR 管理
+  public-address         自动检测或设置公网连接地址
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
   01-36                  对应主菜单编号
