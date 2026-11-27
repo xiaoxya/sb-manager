@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.18
+VERSION=2.2.19
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1297,23 +1297,103 @@ dns_auto(){
  printf '建议策略：%s（检测结果仅代表当前 HTTPS 可达性）\n' "$strategy"
  dns_strategy "$strategy"
 }
-dns_server_set(){
- local choice address
- [[ -s $C ]] || { err '请先初始化服务'; return 1; }
- echo '修改 local-dns 标签对应的服务器；保留其他 DNS 服务器及引用。'
- choice=$(ask '服务器类型 local/udp/tcp' local) || return 1
- case $choice in
- local) address='';;
- udp|tcp)
-  address=$(ask 'DNS IP 地址' '1.1.1.1') || return 1
-  address=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))' "$address" 2>/dev/null) || { err '请输入有效 IP'; return 1; };;
- *) err '无效类型'; return 1;;
- esac
- jq -e '[.dns.servers[]?|select(.tag=="local-dns")]|length==1' "$C" >/dev/null || { err '未找到唯一 local-dns，拒绝修改自定义 DNS'; return 1; }
- confirm '替换 local-dns 服务器并重启 sing-box?' || return 0
- dns_snapshot || return 1
- edit --arg t "$choice" --arg a "$address" '(.dns.servers[]|select(.tag=="local-dns")) = (if $t=="local" then {type:"local",tag:"local-dns"} else {type:$t,tag:"local-dns",server:$a} end)'
+# Build modern DNS server objects with literal IP bootstrap and verified TLS SNI.
+dns_build_server(){
+ local t=$1 a=$2 name=$3 p=$4 path=$5 tag=$6
+ jq -n --arg t "$t" --arg a "$a" --arg n "$name" --argjson p "$p" --arg path "$path" --arg tag "$tag" '
+ if $t=="local" then {type:"local",tag:$tag}
+ else {type:$t,tag:$tag,server:$a,server_port:$p}
+ + (if (["tls","https","quic","h3"]|index($t))!=null then {tls:{enabled:true,server_name:$n}} else {} end)
+ + (if $t=="https" or $t=="h3" then {path:$path} else {} end) end'
 }
+dns_server_set() (
+ local choice protocol t address secondary='' name='' p=53 path=/dns-query w add='' custom=0
+ [[ -s $C ]] || { err '请先初始化服务'; exit 1; }
+ ui_title 'DNS 服务商预设'
+ columns '01 系统默认 DNS|02 Cloudflare|03 Google|04 Quad9' '05 AdGuard|06 阿里云 DNS|07 DNSPod|08 自定义 DNS'
+ echo '00 返回'
+ read -rp "$(ui_prompt '请选择服务商：')" choice || exit 1
+ case $choice in
+  0|00) exit 0;;
+  1|01) t=local; address='';;
+  2|02) address=1.1.1.1; secondary=1.0.0.1; name=cloudflare-dns.com;;
+  3|03) address=8.8.8.8; secondary=8.8.4.4; name=dns.google;;
+  4|04) address=9.9.9.9; secondary=149.112.112.112; name=dns.quad9.net;;
+  5|05) address=94.140.14.14; secondary=94.140.15.15; name=dns.adguard-dns.com;;
+  6|06) address=223.5.5.5; secondary=223.6.6.6; name=dns.alidns.com;;
+  7|07) address=119.29.29.29; secondary=''; name='';;
+  8|08) custom=1; address='';;
+  *) err '无效选项'; exit 1;;
+ esac
+ if [[ $choice != 1 && $choice != 01 ]]; then
+  echo '01 UDP | 02 TCP | 03 DoH | 04 DoT | 05 DoQ | 06 DoH3'
+  protocol=$(ask '选择协议（部分服务商不支持所有协议）' 03) || exit 1
+  case $protocol in 1|01) t=udp;; 2|02) t=tcp;; 3|03) t=https; p=443;; 4|04) t=tls; p=853;; 5|05) t=quic; p=853;; 6|06) t=h3; p=443;; *) err '无效协议'; exit 1;; esac
+  # Conservative verified presets: other combinations require custom input.
+  case "$choice:$t" in
+   2:quic|02:quic|3:quic|03:quic|4:quic|04:quic|7:https|07:https|7:tls|07:tls|7:quic|07:quic|7:h3|07:h3|4:h3|04:h3|6:h3|06:h3|3:h3|03:h3)
+    err '该预设未确认支持此协议，请选择其他协议或自定义'; exit 1;;
+  esac
+  if ((custom)); then
+   address=$(ask 'DNS 服务器 IP（IPv4/IPv6，不含端口或 URL）' 1.1.1.1) || exit 1
+   p=$(ask '端口' "$p") || exit 1
+   [[ $p =~ ^[0-9]{1,5}$ ]] && ((10#$p>=1 && 10#$p<=65535)) || { err '端口无效'; exit 1; }
+   p=$((10#$p))
+   if [[ $t == https || $t == h3 || $t == tls || $t == quic ]]; then
+    name=$(ask 'TLS 证书域名（SNI）' '') || exit 1
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && $name == *.* ]] || { err '请输入证书域名'; exit 1; }
+   fi
+   if [[ $t == https || $t == h3 ]]; then path=$(ask 'HTTPS 查询路径' /dns-query) || exit 1; [[ $path == /* && $path != *[[:space:]]* ]] || exit 1; fi
+  fi
+  address=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))' "$address" 2>/dev/null) || { err 'DNS IP 无效'; exit 1; }
+  # Secondary is explicitly selectable, not a fictitious automatic failover.
+  if [[ -n $secondary ]] && confirm "同时保存备用服务器 $secondary（仅供手动切换，不自动故障转移）?"; then add=$secondary; fi
+ fi
+ jq -e '[.dns.servers[]?|select(.tag=="local-dns")]|length==1' "$C" >/dev/null || { err '未找到唯一 local-dns，拒绝修改'; exit 1; }
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ dns_build_server "$t" "$address" "$name" "$p" "$path" local-dns > "$w/main" || exit 1
+ jq . "$w/main"
+ if [[ -n $add ]]; then
+  if jq -e 'any(.dns.servers[]?;.tag=="sb-dns-secondary")' "$C" >/dev/null; then err '备用标签已存在，请先通过备用切换或恢复原始 DNS 处理'; exit 1; fi
+  dns_build_server "$t" "$add" "$name" "$p" "$path" sb-dns-secondary > "$w/secondary" || exit 1
+ else echo null > "$w/secondary"; fi
+ confirm '备份并应用 DNS 配置？sing-box 将短暂重启' || exit 0
+ dns_snapshot || exit 1
+ edit --slurpfile a "$w/main" --slurpfile b "$w/secondary" '(.dns.servers[]|select(.tag=="local-dns"))=$a[0] | if $b[0]!=null then .dns.servers += [$b[0]] else . end'
+)
+dns_swap(){
+ jq -e '([.dns.servers[]?|select(.tag=="local-dns")]|length)==1 and ([.dns.servers[]?|select(.tag=="sb-dns-secondary")]|length)==1' "$C" >/dev/null || { err '未配置唯一主备 DNS'; return 1; }
+ confirm '交换主备 DNS 地址（保留标签引用），重启 sing-box?' || return 0
+ dns_snapshot || return 1
+ edit '(.dns.servers[]|select(.tag=="local-dns")) as $a | (.dns.servers[]|select(.tag=="sb-dns-secondary")) as $b | .dns.servers |= map(if .tag=="local-dns" then ($b|.tag="local-dns") elif .tag=="sb-dns-secondary" then ($a|.tag="sb-dns-secondary") else . end)'
+}
+# Isolated sing-box instance: use a temporary SOCKS listener and a DNS resolve
+# rule, then measure HTTPS success. This is end-to-end latency, not DNS RTT.
+dns_probe_configured() (
+ local w tag p pid='' url result
+ [[ -s $C ]] || exit 1
+ w=$(mktemp -d) || exit 1
+ trap '[[ -z $pid ]] || { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$w"' EXIT
+ trap 'exit 130' INT; trap 'exit 143' TERM
+ for p in 10896 10897 10898; do [[ -z $(ss -H -lnt "sport = :$p") ]] && break; done
+ [[ -z $(ss -H -lnt "sport = :$p") ]] || exit 1
+ for tag in local-dns sb-dns-secondary; do
+  jq -e --arg t "$tag" 'any(.dns.servers[]?;.tag==$t)' "$C" >/dev/null || continue
+  jq --arg t "$tag" --argjson p "$p" '{log:{level:"debug"},dns:{servers:[.dns.servers[]|select(.tag==$t)],final:$t},inbounds:[{type:"mixed",tag:"test-in",listen:"127.0.0.1",listen_port:$p}],outbounds:[{type:"direct",tag:"direct"}],route:{default_domain_resolver:$t,rules:[{action:"resolve",server:$t}],final:"direct"}}' "$C" > "$w/config.json" || exit 1
+  printf '\n=== %s ===\n' "$tag"
+  if ! sing-box check -c "$w/config.json"; then echo '独立测试配置不兼容（可能依赖其他 DNS/出站）'; continue; fi
+  sing-box run -D "$w" -c "$w/config.json" > "$w/log" 2>&1 & pid=$!
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null; then
+   for url in https://www.cloudflare.com/ https://www.google.com/; do
+    if result=$(curl --noproxy '' --proxy "socks5h://127.0.0.1:$p" -sS -o /dev/null --connect-timeout 5 --max-time 10 -w 'HTTP %{http_code} | 总耗时 %{time_total}s' "$url"); then printf '%s %s\n' "$url" "$result"; else echo "$url 请求失败"; fi
+   done
+  fi
+  kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; pid=''
+  grep -Ei 'dns:.*(lookup|exchange)|ERROR' "$w/log" | tail -15 || :
+ done
+ echo '总耗时包含 DNS、TCP、TLS 和 HTTP；不是纯 DNS 延迟。'
+)
 dns_lookup_test(){
  local host
  host=$(ask '测试域名' www.cloudflare.com) || return 1
@@ -1347,12 +1427,12 @@ dns_menu(){
  while true; do
  ui_title 'DNS 与 IPv6 管理'
  if [[ -s $C ]]; then jq -r '"默认 DNS 策略："+(.dns.strategy//"核心默认")' "$C"; fi
- columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4' '06 仅使用 IPv6|07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置'
+ columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4' '06 仅使用 IPv6|07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置|11 主备 DNS 切换|12 DNS 连通及耗时测试'
  echo '00 返回'
  read -rp "$(ui_prompt '请选择操作：')" n || return
  case $n in
   1|01) dns_show;; 2|02) dns_network;; 3|03) dns_auto;; 4|04) dns_strategy ipv4_only;; 5|05) dns_strategy prefer_ipv4;;
-  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;;
+  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;; 11) dns_swap;; 12) dns_probe_configured;;
   0|00) return;; *) err '无效选项';;
  esac
  done
