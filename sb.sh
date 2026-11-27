@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.21
+VERSION=2.2.22
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -256,17 +256,97 @@ argo_remove(){
  rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json" "$ARGO_NET" || return 1; rmdir "$ARGO_DIR" "$ARGO_DROP" 2>/dev/null || :
  systemctl daemon-reload
 }
+# Read-only stability diagnostics; no automatic tuning of kernel or live services.
+argo_log_stats(){
+ local period log
+ period=$(ask '统计最近多少分钟（1-1440）' 30) || return 1
+ [[ $period =~ ^[0-9]{1,4}$ ]] && ((10#$period>=1 && 10#$period<=1440)) || { err '时间范围无效'; return 1; }
+ log=$(journalctl -u sb-argo.service --since "$((10#$period)) minutes ago" --no-pager -o cat) || return 1
+ printf '最近 %s 分钟 Cloudflared 日志事件（非实际断线次数）：\n' "$period"
+ printf '隧道注册：%s\n' "$(grep -ic 'Registered tunnel connection' <<< "$log" || :)"
+ printf '连接服务失败：%s\n' "$(grep -icE 'failed to serve tunnel connection|serve tunnel error' <<< "$log" || :)"
+ printf '超时：%s\n' "$(grep -icE 'timeout|no recent network activity' <<< "$log" || :)"
+ printf '重试：%s\n' "$(grep -icE 'retrying connection|retrying in' <<< "$log" || :)"
+ printf '错误/警告：%s\n' "$(grep -icE ' (ERR|WRN) ' <<< "$log" || :)"
+ echo '最近相关日志：'
+ grep -Ei ' (ERR|WRN) |timeout|retrying|registered tunnel connection' <<< "$log" | tail -40 || :
+}
+argo_tcp_quality(){
+ local seconds before after
+ need nstat ss || return 1
+ seconds=$(ask '采样间隔秒数（1-60）' 10) || return 1
+ [[ $seconds =~ ^[0-9]{1,2}$ ]] && ((10#$seconds>=1 && 10#$seconds<=60)) || return 1
+ sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+ ss -s
+ before=$(nstat -asz) || return 1
+ sleep "$((10#$seconds))"
+ after=$(nstat -asz) || return 1
+ python3 -c 'import sys
+def parse(s):
+ return {x[0]:int(x[1]) for l in s.splitlines() if len(x:=l.split())>=2 and x[1].isdigit()}
+a,b=map(parse,sys.argv[1:])
+keys=["TcpOutSegs","TcpRetransSegs","TcpExtTCPTimeouts"]
+for k in keys:
+ print(k, b[k]-a[k] if k in a and k in b and b[k]>=a[k] else "N/A")
+if all(k in a and k in b for k in keys[:2]) and b["TcpOutSegs"]>a["TcpOutSegs"] and b["TcpRetransSegs"]>=a["TcpRetransSegs"]:
+ print("TCP 重传段/发送段近似比率：%.2f%%"%(100*(b["TcpRetransSegs"]-a["TcpRetransSegs"])/(b["TcpOutSegs"]-a["TcpOutSegs"])))' "$before" "$after"
+ echo '以上是整个系统 TCP 统计，不是 QUIC 丢包率，也不是单个 YouTube 连接。'
+}
+argo_video_diagnose(){
+ local log host
+ log=$(journalctl -u sing-box --since '30 minutes ago' --no-pager -o cat) || return 1
+ echo '最近 30 分钟视频相关日志（最多 40 行）：'
+ grep -Ei 'googlevideo\.com|youtube\.com' <<< "$log" | tail -40 || :
+ echo '近期视频域名 VPS 直连 HTTPS 测试（不经过 Argo）：'
+ while IFS= read -r host; do
+  [[ $host =~ ^[A-Za-z0-9.-]+\.googlevideo\.com$ ]] || continue
+  printf '%s ' "$host"
+  curl -4 --noproxy '*' -sS -o /dev/null --connect-timeout 5 --max-time 12 -w 'HTTP %{http_code} DNS %{time_namelookup}s TCP %{time_connect}s TLS %{time_appconnect}s 总计 %{time_total}s\n' "https://$host/" || :
+ done < <(grep -Eo '[A-Za-z0-9.-]+\.googlevideo\.com' <<< "$log" | sort -u | head -5)
+ echo 'CDN 根路径返回 403/404 不代表视频播放失败；此测试不验证真实视频分片。'
+ echo '同期 sing-box 错误（可能包含其他客户端）：'
+ grep -Ei 'ERROR|broken pipe|reset by peer|i/o timeout' <<< "$log" | tail -25 || :
+}
+argo_repeat_probe(){
+ local n i ok=0 fail=0
+ n=$(ask '重复公网节点测试次数（1-10）' 3) || return 1
+ [[ $n =~ ^[0-9]{1,2}$ ]] && ((10#$n>=1 && 10#$n<=10)) || return 1
+ for ((i=1;i<=10#$n;i++)); do
+  printf '\n=== 公网端到端测试 %s/%s ===\n' "$i" "$n"
+  if argo_public_test; then ((ok+=1)); else ((fail+=1)); fi
+  if ((i<10#$n)); then sleep 2; fi
+ done
+ printf '成功：%s 失败：%s\n' "$ok" "$fail"
+ echo '重复短请求不等于持续视频长连接测试。'
+ ((fail==0))
+}
+argo_stability_monitor(){
+ echo '同时显示 Argo 与 sing-box 实时日志；Ctrl+C 退出。'
+ journalctl -u sb-argo.service -u sing-box.service -n 20 -f -o short-iso | grep --line-buffered -Ei 'googlevideo|youtube|ERR|WRN|timeout|reset|broken pipe|EOF|closed|registered|retry'
+}
+argo_stability_menu(){
+ local n
+ while true; do
+ ui_title 'Argo 稳定性诊断'
+ columns '01 查看隧道日志统计|02 YouTube CDN 诊断|03 TCP 网络质量' '04 重复公网节点测试|05 双服务实时日志|06 切换 QUIC/HTTP2'
+ echo '00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in
+  1|01) argo_log_stats;; 2|02) argo_video_diagnose;; 3|03) argo_tcp_quality;; 4|04) argo_repeat_probe;; 5|05) argo_stability_monitor;; 6|06) argo_network_set protocol;; 0|00) return;; *) err '无效选项';;
+ esac
+ done
+}
 argo_menu(){
  local n
  while true; do ui_title 'Argo 固定隧道管理'
  argo_health || :
  columns '01 安装连接器|02 配置固定隧道及 WS 入站|03 查看隧道状态|04 查看分享链接|05 启动连接器|06 停止连接器|07 实时日志' '08 删除本地隧道|09 重启连接器|10 设置传输协议|11 设置 IP 版本|12 网络环境检测|13 公网节点测试|14 IPv4 自动修复'
- echo '00 返回'
+ columns '15 稳定性诊断' '00 返回'
  read -rp "$(ui_prompt '请选择操作：')" n || return
  case $n in
   1|01) argo_install_core;; 2|02) argo_setup;; 3|03) argo_status;; 4|04) argo_info;;
   5|05) argo_start_checked start;; 6|06) systemctl stop sb-argo.service;; 7|07) journalctl -u sb-argo.service -n 30 -f;; 8|08) argo_remove;;
-  9|09) argo_start_checked restart;; 10) argo_network_set protocol;; 11) argo_network_set ip;; 12) argo_network_test;; 13) argo_public_test;; 14) argo_network_set repair;;
+  9|09) argo_start_checked restart;; 10) argo_network_set protocol;; 11) argo_network_set ip;; 12) argo_network_test;; 13) argo_public_test;; 14) argo_network_set repair;; 15) argo_stability_menu;;
   0|00) return;; *) err '无效选项';;
  esac
  done
@@ -1081,6 +1161,7 @@ sing-box Manager v$VERSION
   public-address         自动检测或设置公网连接地址
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
+  argo-stability         Argo 稳定性诊断
   dns                    DNS 与 IPv6 管理（含系统级 IPv6 启停）
   01-37                  对应主菜单编号
   99                     彻底卸载服务
@@ -1654,6 +1735,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; 37|dns) dns_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
