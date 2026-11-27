@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.9** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.10** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -345,3 +345,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 `sb --help` / `sb -h` / `sb help` 查看命令帮助，`sb --version` / `sb -v` 查看版本，均无需 root。菜单 08 / `sb info` 仅显示入站节点信息，不再附加出站配置。
 
 菜单 10 → 09 或 `sb export-outbound`（别名 `sb export-node`）导出单个或全部出站为原生 JSON 对象 `{"outbounds":[...]}`。默认路径 `/root/sb-outbounds-年月日-时分秒.json`，不覆盖已有文件，权限 600。导出包含认证信息，需确认并妥善保存。该文件并非完整 sing-box 配置，也不能直接通过分享链接导入菜单导入。导出不修改运行配置或重启服务。
+
+## v2.2.10 出站分享链接优先导出
+
+菜单 10 → 09 或 `sb export-outbound` 支持单个或全部出站。优先生成 VLESS REALITY/TLS TCP、AnyTLS、Hysteria2、Shadowsocks/SS2022 分享链接，并使用内置导入解析器进行配置往返一致性检查；无法完整转换的节点（含 Snell、direct 或额外高级字段）回退至原生 JSON。输入路径前缀后按需生成 `.txt`（每行一条链接）及 `.json`（仅回退节点，格式 `{"outbounds":[...]}`）。文件权限 600，不覆盖已有文件，可确认后在终端显示分享链接。导出含认证信息，请妥善保管。默认链接格式的客户端兼容性尚未实机验证。导出不修改代理配置或重启服务。
