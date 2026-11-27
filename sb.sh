@@ -890,6 +890,12 @@ def cells(s): return sum(0 if u.combining(c) else 2 if u.east_asian_width(c) in 
 def p(s,c): return "\033["+c+"m"+s+"\033[0m" if color else s
 def fmt(s):
  if s.startswith("◆"): return p(s,"1;36")
+ if s.startswith("运行中"): return p("运行中","1;32")+s[len("运行中"):]
+ if s.startswith(("故障","未运行")): return p(s,"1;31")
+ if s.startswith("Argo：健康"): return p("Argo：健康","1;32")+s[len("Argo：健康"):]
+ if s.startswith("Argo：不健康"): return p(s,"1;31")
+ if s.startswith("防护：运行中"): return p("防护：运行中","1;32")+s[len("防护：运行中"):]
+ if s.startswith("证书：已过期"): return p(s,"1;31")
  m=re.match(r"^(\d+)(\s+)(.*)$",s)
  if not m: return s
  n,sp,label=m.groups()
@@ -900,6 +906,7 @@ def fmt(s):
  elif any(x in label for x in ("分流","中转","出站")): c="1;34"
  return p(n,"1;32")+sp+(p(label,c) if c else label)
 n=max(36,max(map(cells,a))+4)
+if w>=110: n=max(n,w//2)
 if w<90 or n+max(map(cells,b))>w:
  for x in a+b:
   if x: print(fmt(x))
@@ -1344,6 +1351,7 @@ sing-box Manager v$VERSION
   cert                   TLS 证书管理
   security               REALITY 安全防护管理
   01-39                  保留 v2.2 旧数字 CLI 映射（与新版交互菜单不同）
+  menu [01-20]           打开新版主菜单或按新版编号执行（推荐使用文字命令）
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
@@ -2386,6 +2394,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; 39|security) security_menu;; security-stats) sec_stats;; core-version) sing-box version;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; menu) if [[ -z ${2:-} ]]; then menu; elif [[ $2 == 20 ]]; then self_update_cli; else main_choice "$2"; fi;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; 39|security) security_menu;; security-stats) sec_stats;; core-version) sing-box version;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
