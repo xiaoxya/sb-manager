@@ -808,8 +808,8 @@ stop_managed_unit(){
 uninstall_service(){
  local answer pkg old q p owner cloud_owned=0 keep_cloud=0
  local -a leftovers=()
- need systemctl dpkg-query apt-get sysctl || return 1
- [[ -d /run/systemd/system ]] || { err 'systemd 不可用，无法安全停止服务'; return 1; }
+ need systemctl dpkg-query apt-get sysctl pgrep || return 1
+ [[ -d /run/systemd/system ]] && systemctl show -p Version --value >/dev/null 2>&1 || { err 'systemd 不可用，无法安全停止服务'; return 1; }
  echo '彻底卸载将停止 sing-box 和 sb-argo，删除核心、节点、证书、规则、缓存、管理器及其备份。'
  echo '删除 /root/sb-backups 和默认路径的节点/规则导出文件；无法恢复。请先另行保存需要的数据。'
  echo '恢复本工具保存的 BBR 参数，移除本工具的 journald 限额。共用系统依赖及其他应用不强制删除。'
@@ -839,7 +839,7 @@ uninstall_service(){
  fi
  for pkg in sing-box sing-box-beta sing-box-alpha; do purge_service_package "$pkg" || return 1; done
  # Official package purge removes packaged files; clean known manual installations too.
- for p in /usr/local/bin/sing-box /usr/bin/sing-box /etc/systemd/system/sing-box.service; do
+ for p in /usr/local/bin/sing-box /usr/bin/sing-box /etc/systemd/system/sing-box.service /usr/lib/systemd/system/sing-box.service /lib/systemd/system/sing-box.service; do
   if [[ -e $p || -L $p ]]; then
    if dpkg-query -S "$p" >/dev/null 2>&1; then leftovers+=("$p (其他软件包所有)"); else rm -f -- "$p" || return 1; fi
   fi
@@ -870,7 +870,8 @@ uninstall_service(){
    fi
   fi
  fi
- rm -f -- "$ARGO_UNIT" /etc/apt/sources.list.d/sb-cloudflared.list || return 1
+ rm -f -- "$ARGO_UNIT" || return 1
+ if (( ! keep_cloud )); then rm -f -- /etc/apt/sources.list.d/sb-cloudflared.list || return 1; fi
  # Do not remove a signing key still referenced by another repository.
  if ! grep -RqsF /usr/share/keyrings/sb-cloudflare.gpg /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
   rm -f /usr/share/keyrings/sb-cloudflare.gpg || return 1
@@ -884,9 +885,10 @@ uninstall_service(){
  systemctl daemon-reload || return 1
  systemctl reset-failed sing-box.service sb-argo.service 2>/dev/null || :
  if systemctl is-active --quiet sing-box.service || systemctl is-active --quiet sb-argo.service; then err '服务仍在运行，保留管理器供排查'; return 1; fi
+ hash -r
  if command -v sing-box >/dev/null; then leftovers+=("$(command -v sing-box) (未识别的核心路径)"); fi
  if ((keep_cloud)); then echo '检测到其他用途或来源不明的 cloudflared，已保留。'; fi
- if (("${#leftovers[@]}" > 0)); then printf '未自动清除：%s\n' "${leftovers[@]}"; err '请检查残留项后重试；管理器已保留'; return 1; fi
+ if ((${#leftovers[@]} > 0)); then printf '未自动清除：%s\n' "${leftovers[@]}"; err '请检查残留项后重试；管理器已保留'; return 1; fi
  rm -f -- /usr/local/bin/sb || return 1
  hash -r
  msg OK '本工具管理的代理服务和已知配置已卸载；共用组件、系统日志及云端资源不强制清除。'
