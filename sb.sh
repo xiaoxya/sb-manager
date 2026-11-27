@@ -1875,7 +1875,7 @@ acme_pair_check(){
  [[ $a == "$b" ]] || { err '证书和私钥不匹配'; return 1; }
 }
 acme_deploy_pair() (
- local c=$1 k=$2 domain=$3 mode=$4 w='' oldpin newpin active=0 old='' u g
+ local c=$1 k=$2 domain=$3 mode=$4 w='' oldpin newpin active=0 old='' u g new_sni='' mismatch=0
  [[ -s $C ]] || { err '请先初始化代理服务'; exit 1; }
  need openssl jq flock || exit 1
  install -d -m 700 "$ACME_DIR" || exit 1
@@ -1883,6 +1883,7 @@ acme_deploy_pair() (
  acme_pair_check "$c" "$k" || exit 1
  # Only replace the shared pair already used by manager-created TLS inbounds.
  jq -e 'any(.inbounds[]?;.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem" and .tls.key_path=="/etc/sing-box/cert/server.key")' "$C" >/dev/null || { err '没有使用共享证书路径的入站，拒绝部署'; exit 1; }
+ if jq -e 'any(.inbounds[]?; ((.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem") != (.tls.key_path=="/etc/sing-box/cert/server.key")))' "$C" >/dev/null; then err '有入站仅引用共享证书或私钥之一，拒绝替换'; exit 1; fi
  [[ -s $ACME_DEPLOY/fullchain.pem && -s $ACME_DEPLOY/server.key ]] || { err '共享证书不完整'; exit 1; }
  oldpin=$(pin "$ACME_DEPLOY/fullchain.pem") || exit 1
  newpin=$(pin "$c") || exit 1
@@ -1891,16 +1892,27 @@ acme_deploy_pair() (
   printf '旧 SPKI: %s\n新 SPKI: %s\n' "$oldpin" "$newpin"
   jq -r '.inbounds[]?|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem")|[.tag,.tls.server_name]|@tsv' "$C"
   echo '客户端须使用证书覆盖的 SNI；原有公钥固定客户端可能需要更新。'
-  confirm '备份并替换共享证书？不会自动修改客户端 SNI' || exit 0
+  confirm '继续检查证书覆盖范围并准备部署？' || exit 0
  fi
  # Require existing SNI to match the new certificate, including wildcard matching.
  while IFS= read -r u; do
   [[ -n $u ]] || continue
-  openssl x509 -in "$c" -noout -checkhost "$u" | grep -q 'does match certificate' || { err "证书不覆盖现有 SNI：$u；请先调整节点 SNI"; exit 1; }
+  if ! openssl x509 -in "$c" -noout -checkhost "$u" | grep -q 'does match certificate'; then echo "证书不覆盖现有 SNI：$u"; mismatch=1; fi
  done < <(jq -r '.inbounds[]?|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem")|.tls.server_name//empty' "$C")
+ if ((mismatch)); then
+  [[ $mode != auto ]] || { err '自动部署拒绝修改 SNI'; exit 1; }
+  new_sni=$(ask '输入新证书覆盖的 SNI（会更新共享证书入站）' "$domain") || exit 1
+  new_sni=$(acme_domain "$new_sni") || exit 1
+  openssl x509 -in "$c" -noout -checkhost "$new_sni" | grep -q 'does match certificate' || { err '证书不覆盖新 SNI'; exit 1; }
+  echo '现有客户端需同步修改 SNI；公网地址、端口、密码不变。'
+  confirm "将共享证书入站 SNI 更新为 $new_sni 并部署?" || exit 0
+ fi
  w=$(mktemp -d) || exit 1; trap 'rm -rf -- "$w"' EXIT
  old=$(backup) || exit 1
- cp -a "$ACME_DEPLOY/fullchain.pem" "$w/oldcert" && cp -a "$ACME_DEPLOY/server.key" "$w/oldkey" || exit 1
+ cp -a "$ACME_DEPLOY/fullchain.pem" "$w/oldcert" && cp -a "$ACME_DEPLOY/server.key" "$w/oldkey" && cp -a "$C" "$w/oldconfig" || exit 1
+ if [[ -n $new_sni ]]; then
+  jq --arg n "$new_sni" '(.inbounds[]|select(.tls.certificate_path=="/etc/sing-box/cert/fullchain.pem" and .tls.key_path=="/etc/sing-box/cert/server.key")|.tls.server_name)=$n' "$C" > "$w/newconfig" || exit 1
+ fi
  systemctl is-active --quiet sing-box && active=1
  u=$(systemctl show sing-box -p User --value); u=${u:-root}
  g=$(systemctl show sing-box -p Group --value); g=${g:-$(id -gn "$u")}
@@ -1908,14 +1920,16 @@ acme_deploy_pair() (
     install -o root -g "$g" -m 640 "$k" "$ACME_DEPLOY/server.key.new" &&
     mv -f "$ACME_DEPLOY/fullchain.pem.new" "$ACME_DEPLOY/fullchain.pem" &&
     mv -f "$ACME_DEPLOY/server.key.new" "$ACME_DEPLOY/server.key" &&
+    { [[ -z $new_sni ]] || { install -o root -g "$g" -m 640 "$w/newconfig" "$C.new" && mv -f "$C.new" "$C"; }; } &&
     sing-box check -C /etc/sing-box &&
     { ((active==0)) || { systemctl restart sing-box && sleep 2 && systemctl is-active --quiet sing-box; }; }; then
   if [[ $mode != auto ]]; then
-   if [[ -n $domain ]]; then printf '%s\n' "$domain" > "$ACME_HOOK"; else rm -f "$ACME_HOOK"; fi
+   if [[ -n $domain ]]; then printf '%s\n' "$domain" > "$ACME_HOOK" || { err "证书已部署，但自动部署绑定保存失败"; exit 1; }; else rm -f "$ACME_HOOK" || exit 1; fi
   fi
   msg OK "证书已部署，备份：$old"; exit 0
  fi
- rm -f "$ACME_DEPLOY/fullchain.pem.new" "$ACME_DEPLOY/server.key.new"
+ rm -f "$ACME_DEPLOY/fullchain.pem.new" "$ACME_DEPLOY/server.key.new" "$C.new"
+ cp -a "$w/oldconfig" "$C" || { err "配置恢复失败，备份：$old"; exit 1; }
  cp -a "$w/oldcert" "$ACME_DEPLOY/fullchain.pem" && cp -a "$w/oldkey" "$ACME_DEPLOY/server.key" || { err "恢复失败，备份：$old"; exit 1; }
  if ((active)); then systemctl restart sing-box || :; fi
  err "证书部署失败，已尝试恢复，备份：$old"
