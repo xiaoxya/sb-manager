@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.19
+VERSION=2.2.20
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -648,11 +648,11 @@ def fmt(s):
  elif any(x in label for x in ("初始化","恢复","重启","清理","删除","更新核心")): c="1;33"
  elif any(x in label for x in ("分流","中转","出站")): c="1;34"
  return p(n,"1;32")+sp+(p(label,c) if c else label)
-if w<90 or max(map(cells,a))+max(map(cells,b))+4>w:
+n=max(36,max(map(cells,a))+4)
+if w<90 or n+max(map(cells,b))>w:
  for x in a+b:
   if x: print(fmt(x))
 else:
- n=max(map(cells,a))+4
  for i in range(max(len(a),len(b))):
   l=a[i] if i<len(a) else ""; r=b[i] if i<len(b) else ""; print(fmt(l)+(" "*max(0,n-cells(l))+fmt(r) if r else ""))' "$width" "$1" "$2" "$color"
 }
@@ -968,6 +968,7 @@ uninstall_service(){
    if dpkg-query -S "$p" >/dev/null 2>&1; then leftovers+=("$p (其他软件包所有)"); else rm -f -- "$p" || return 1; fi
   fi
  done
+ if [[ -e $IPV6_STATE ]]; then ipv6_restore purge || return 1; elif [[ -e $IPV6_CONF ]]; then echo "IPv6 配置来源不明，保留 $IPV6_CONF，请手动处理"; fi
  if [[ -e $BBR_CONF || -e $BBR_STATE ]]; then
   if [[ -s $BBR_STATE ]]; then
    { read -r old; read -r q; } < "$BBR_STATE"
@@ -1080,7 +1081,7 @@ sing-box Manager v$VERSION
   public-address         自动检测或设置公网连接地址
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
-  dns                    DNS 与 IPv6 管理
+  dns                    DNS 与 IPv6 管理（含系统级 IPv6 启停）
   01-37                  对应主菜单编号
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
@@ -1422,17 +1423,88 @@ dns_restore(){
  )' || return 1
  rm -f "$DNS_STATE"
 }
+IPV6_CONF=/etc/sysctl.d/99-sb-ipv6.conf
+IPV6_STATE=/var/lib/sb-manager/ipv6-original.json
+ipv6_status(){
+ local p
+ echo '系统 IPv6 接口状态（1=禁用，0=启用）：'
+ for p in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [[ -r $p ]] || continue
+  printf '%-20s %s\n' "$(basename "$(dirname "$p")")" "$(cat "$p")"
+ done
+ ip -6 addr show; ip -6 route show
+ [[ ! -e $IPV6_CONF ]] || printf '持久化配置：%s\n' "$IPV6_CONF"
+ [[ ! -e $IPV6_STATE ]] || printf '原始状态记录：%s\n' "$IPV6_STATE"
+}
+ipv6_capture(){
+ python3 -c 'import glob,json
+d={p.split("/")[-2]:int(open(p).read().strip()) for p in glob.glob("/proc/sys/net/ipv6/conf/*/disable_ipv6")}
+assert "all" in d and "default" in d and all(v in (0,1) for v in d.values())
+print(json.dumps(d))'
+}
+ipv6_restore_runtime(){
+ python3 - "$1" <<'PYIP6'
+import json,sys,pathlib
+d=json.load(open(sys.argv[1]))
+assert isinstance(d,dict) and "all" in d and "default" in d
+assert all(k not in (".","..") and "/" not in k and v in (0,1) for k,v in d.items())
+base=pathlib.Path("/proc/sys/net/ipv6/conf")
+for k in ["all","default"]+[p.name for p in base.iterdir() if p.name not in ("all","default")]:
+ p=base/k/"disable_ipv6"
+ if p.exists():
+  v=d.get(k,d["default"])
+  if int(p.read_text())!=v: p.write_text(str(v)+"\n")
+PYIP6
+}
+ipv6_restore(){
+ [[ -s $IPV6_STATE ]] || { err '没有本工具保存的 IPv6 原始状态'; return 1; }
+ if [[ "${1:-}" != purge ]]; then
+  confirm '恢复原始 IPv6 接口状态并移除本工具的持久化设置？可能影响网络连接' || return 0
+ fi
+ ipv6_restore_runtime "$IPV6_STATE" || { err '恢复失败，保留记录'; return 1; }
+ rm -f -- "$IPV6_CONF" "$IPV6_STATE" || return 1
+ msg OK '已恢复记录的 IPv6 状态；地址与路由可能需网络管理器重新获取'
+}
+ipv6_change() (
+ local v=$1 answer w had=0
+ [[ -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || { err '内核 IPv6 sysctl 不可用'; exit 1; }
+ [[ ! -e $IPV6_CONF || -s $IPV6_STATE ]] || { err '已存在无原始记录的 IPv6 配置，请先手动处理'; exit 1; }
+ echo '系统级操作影响所有网卡、IPv6 回环地址及依赖 IPv6 的服务。请使用 IPv4 SSH；容器可能无权限。'
+ if [[ $v == 1 ]]; then
+  read -rp '确认禁用请输入 DISABLE：' answer || exit 1
+  [[ $answer == DISABLE ]] || exit 0
+ else
+  confirm '启用所有接口 IPv6 并持久化？' || exit 0
+ fi
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ ipv6_capture > "$w/before" || exit 1
+ if [[ -e $IPV6_CONF ]]; then cp -a "$IPV6_CONF" "$w/old" || exit 1; had=1; fi
+ install -d -m 700 /var/lib/sb-manager || exit 1
+ if [[ ! -s $IPV6_STATE ]]; then install -m 600 "$w/before" "$IPV6_STATE" || exit 1; fi
+ printf 'net.ipv6.conf.all.disable_ipv6 = %s\nnet.ipv6.conf.default.disable_ipv6 = %s\nnet.ipv6.conf.lo.disable_ipv6 = %s\n' "$v" "$v" "$v" > "$w/new" || exit 1
+ local p ok=1
+ for p in /proc/sys/net/ipv6/conf/all/disable_ipv6 /proc/sys/net/ipv6/conf/default/disable_ipv6 /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [[ -e $p ]] || continue
+  if [[ $(cat "$p") != "$v" ]]; then printf '%s\n' "$v" > "$p" || { ok=0; break; }; fi
+ done
+ if ((ok)) && install -m 644 "$w/new" "$IPV6_CONF"; then msg OK '系统 IPv6 设置已应用'; ipv6_status; exit 0; fi
+ err '设置失败，尝试恢复操作前的状态'
+ ipv6_restore_runtime "$w/before" || err '运行时恢复失败，请检查权限'
+ if ((had)); then cp -a "$w/old" "$IPV6_CONF" || :; else rm -f "$IPV6_CONF" || :; fi
+ exit 1
+)
 dns_menu(){
  local n
  while true; do
  ui_title 'DNS 与 IPv6 管理'
  if [[ -s $C ]]; then jq -r '"默认 DNS 策略："+(.dns.strategy//"核心默认")' "$C"; fi
- columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4' '06 仅使用 IPv6|07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置|11 主备 DNS 切换|12 DNS 连通及耗时测试'
+ columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4|06 仅使用 IPv6' '07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置|11 主备 DNS 切换|12 DNS 连通及耗时测试'
+ columns '13 系统 IPv6 状态|14 禁用系统 IPv6' '15 恢复系统 IPv6|16 启用系统 IPv6'
  echo '00 返回'
  read -rp "$(ui_prompt '请选择操作：')" n || return
  case $n in
   1|01) dns_show;; 2|02) dns_network;; 3|03) dns_auto;; 4|04) dns_strategy ipv4_only;; 5|05) dns_strategy prefer_ipv4;;
-  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;; 11) dns_swap;; 12) dns_probe_configured;;
+  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;; 11) dns_swap;; 12) dns_probe_configured;; 13) ipv6_status;; 14) ipv6_change 1;; 15) ipv6_restore;; 16) ipv6_change 0;;
   0|00) return;; *) err '无效选项';;
  esac
  done
@@ -1500,7 +1572,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
+ columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器|' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
