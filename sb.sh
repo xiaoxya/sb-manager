@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.16
+VERSION=2.2.17
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -52,7 +52,123 @@ env_report(){
 }
 ARGO_UNIT=/etc/systemd/system/sb-argo.service
 ARGO_DIR=/etc/sb-argo
-argo_status(){ systemctl status sb-argo.service --no-pager -l; }
+ARGO_DROP=/etc/systemd/system/sb-argo.service.d
+ARGO_NET=$ARGO_DROP/network.conf
+# A registration log is historical evidence, not a live connection count.
+argo_metrics(){
+ local pid log addr
+ pid=$(systemctl show sb-argo.service -p MainPID --value 2>/dev/null) || return 1
+ [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+ log=$(journalctl -u sb-argo.service "_PID=$pid" -b --no-pager -o cat 2>/dev/null) || return 1
+ addr=$(sed -nE 's/.*Starting metrics server on (127\.0\.0\.1:[0-9]+)\/metrics.*/\1/p' <<< "$log" | tail -1)
+ [[ -n $addr ]] || return 1
+ printf '%s\n' "$addr"
+}
+argo_ready(){
+ local addr
+ systemctl is-active --quiet sb-argo.service || return 1
+ addr=$(argo_metrics) || return 1
+ curl --noproxy '*' -fsS --connect-timeout 2 --max-time 3 "http://$addr/ready" >/dev/null 2>&1
+}
+argo_health(){
+ local pid log n addr live execargs ipver proto
+ if ! systemctl is-active --quiet sb-argo.service; then echo '连接器：未运行'; return 1; fi
+ pid=$(systemctl show sb-argo.service -p MainPID --value 2>/dev/null) || return 1
+ log=$(journalctl -u sb-argo.service "_PID=$pid" -b --no-pager -o cat 2>/dev/null) || log=''
+ n=$(sed -nE '/Registered tunnel connection/s/.*connIndex=([0-9]+).*/\1/p' <<< "$log" | sort -u | wc -l)
+ execargs=$(systemctl show sb-argo.service -p ExecStart --value 2>/dev/null)
+ ipver=$(sed -nE 's/.*--edge-ip-version[ =]+(auto|4|6)([ ;]|$).*/\1/p' <<< "$execargs"); ipver=${ipver:-默认}
+ proto=$(sed -nE 's/.*--protocol[ =]+(auto|quic|http2)([ ;]|$).*/\1/p' <<< "$execargs"); proto=${proto:-auto}
+ printf '连接器：运行中 | IP 版本：%s | 配置协议：%s\n' "$ipver" "$proto"
+ printf '本次进程曾注册连接：%s / 4（非实时数量）\n' "$n"
+ if addr=$(argo_metrics); then
+  live=$(curl --noproxy '*' -fsS --connect-timeout 2 --max-time 3 "http://$addr/metrics" 2>/dev/null | awk '$1=="cloudflared_tunnel_ha_connections"{print $2;exit}') || live=''
+  [[ -z $live ]] || printf '当前活动连接指标：%s\n' "$live"
+ fi
+ if [[ -s $C ]]; then jq -r '.inbounds[]|select(.tag=="argo-vless-in")|"本地入站：\(.listen):\(.listen_port)"' "$C" 2>/dev/null; fi
+ if argo_ready; then msg OK '隧道实时 readiness 检查通过'; return 0; fi
+ echo '隧道实时健康尚未确认（可能仍在注册，或 metrics 不可用）'
+ return 1
+}
+argo_wait(){
+ local i
+ for ((i=0;i<30;i++)); do
+  systemctl is-active --quiet sb-argo.service || return 1
+  argo_ready && return 0
+  sleep 1
+ done
+ return 1
+}
+argo_status(){ systemctl status sb-argo.service --no-pager -l; argo_health; }
+argo_network_set() (
+ local field=${1:-both} bin current ipver proto w other
+ [[ -s $ARGO_UNIT && -s $ARGO_DIR/token ]] || { err '请先配置 Argo'; exit 1; }
+ bin=$(command -v cloudflared) || exit 1
+ [[ $bin =~ ^/[A-Za-z0-9_./-]+$ ]] || exit 1
+ current=$(systemctl show sb-argo.service -p ExecStart --value) || exit 1
+ ipver=$(sed -nE 's/.*--edge-ip-version[ =]+(auto|4|6)([ ;]|$).*/\1/p' <<< "$current"); ipver=${ipver:-4}
+ proto=$(sed -nE 's/.*--protocol[ =]+(auto|quic|http2)([ ;]|$).*/\1/p' <<< "$current"); proto=${proto:-auto}
+ for other in "$ARGO_DROP"/*.conf; do
+  [[ -f $other && $other != "$ARGO_NET" ]] || continue
+  if grep -Eq '^[[:space:]]*ExecStart[[:space:]]*=' "$other"; then err "存在其他 ExecStart 覆盖：$other，请手动处理"; exit 1; fi
+ done
+ if [[ -f $ARGO_NET ]]; then
+  if grep -Evq '^[[:space:]]*(#.*|;.*|\[Service\]|ExecStart=|ExecStart=/[^[:space:]]+/cloudflared tunnel --no-autoupdate( --edge-ip-version (auto|4|6)| --protocol (auto|quic|http2)| --metrics 127\.0\.0\.1:[0-9]+)* run --token-file /etc/sb-argo/token|)$' "$ARGO_NET"; then err 'network.conf 含自定义内容，拒绝覆盖'; exit 1; fi
+ fi
+ case $field in
+ ip) ipver=$(ask '边缘 IP 版本 auto/4/6' "$ipver") || exit 1;;
+ protocol) proto=$(ask '传输协议 auto/quic/http2' "$proto") || exit 1;;
+ repair) ipver=4; proto=auto;;
+ *) exit 1;;
+ esac
+ [[ $ipver == auto || $ipver == 4 || $ipver == 6 ]] && [[ $proto == auto || $proto == quic || $proto == http2 ]] || { err '参数无效'; exit 1; }
+ confirm "设置 IP 版本 $ipver / $proto，重启 Argo 并验证实时健康，失败恢复旧配置?" || exit 0
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ local active=0 had=0
+ systemctl is-active --quiet sb-argo.service && active=1
+ if [[ -f $ARGO_NET ]]; then cp -a "$ARGO_NET" "$w/old" || exit 1; had=1; fi
+ mkdir -p "$ARGO_DROP" || exit 1
+ cat > "$w/new" <<UNIT
+[Service]
+ExecStart=
+ExecStart=$bin tunnel --no-autoupdate --edge-ip-version $ipver --protocol $proto run --token-file $ARGO_DIR/token
+UNIT
+ install -m 644 "$w/new" "$ARGO_NET" || exit 1
+ if systemctl daemon-reload && systemctl restart sb-argo.service && argo_wait; then msg OK '网络参数已应用，隧道实时健康检查通过'; argo_health; exit 0; fi
+ echo '新配置未通过实时健康检查，恢复原配置。'
+ if ((had)); then cp -a "$w/old" "$ARGO_NET" || exit 1; else rm -f "$ARGO_NET" || exit 1; fi
+ systemctl daemon-reload || exit 1
+ if ((active)); then systemctl restart sb-argo.service || exit 1; else systemctl stop sb-argo.service || exit 1; fi
+ err '新配置未确认成功，已尝试恢复旧设置'
+)
+argo_network_test(){
+ local region addr
+ need getent nc || return 1
+ for region in region1 region2; do
+  printf '\n=== %s IPv4 TCP 7844 ===\n' "$region"
+  while IFS= read -r addr; do
+   [[ -n $addr ]] || continue
+   nc -4 -z -w 3 "$addr" 7844 && printf '%s: OK\n' "$addr" || printf '%s: FAIL\n' "$addr"
+  done < <(getent ahostsv4 "$region.v2.argotunnel.com" | awk '{print $1}' | sort -u)
+ done
+ echo 'UDP/QUIC 是否成功以 cloudflared 当前进程预检查和注册日志为准：'
+ local pid; pid=$(systemctl show sb-argo.service -p MainPID --value 2>/dev/null) || return 1
+ journalctl -u sb-argo.service "_PID=$pid" -b --no-pager -o cat | grep -Ei 'UDP Connectivity|TCP Connectivity|precheck complete|Registered tunnel connection' | tail -30 || :
+}
+argo_public_test() (
+ local w host
+ [[ -s $ARGO_DIR/meta.json && -s $C ]] || { err '未配置 Argo'; exit 1; }
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ host=$(jq -er '.hostname' "$ARGO_DIR/meta.json") || exit 1
+ jq -e --arg h "$host" '.inbounds[]|select(.tag=="argo-vless-in" and .transport.type=="ws")|{type:"vless",tag:"argo-public-test",server:$h,server_port:443,uuid:.users[0].uuid,tls:{enabled:true,server_name:$h},transport:{type:"ws",path:.transport.path,headers:{Host:$h}}}' "$C" > "$w/o" || exit 1
+ echo '通过公网域名建立真实 VLESS WS TLS 连接并查询出口 IP；不修改正式配置。'
+ probe "$w/o"
+)
+argo_start_checked(){
+ local action=$1
+ systemctl "$action" sb-argo.service || return 1
+ if argo_wait; then argo_health; else err '连接器已启动，但隧道实时健康未确认'; return 1; fi
+}
 argo_install_core(){
  env_preflight || return 1
  command -v cloudflared >/dev/null && { cloudflared --version; return; }
@@ -103,7 +219,7 @@ After=network-online.target sing-box.service
 Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=$bin tunnel --no-autoupdate run --token-file $ARGO_DIR/token
+ExecStart=$bin tunnel --no-autoupdate --edge-ip-version 4 --protocol auto run --token-file $ARGO_DIR/token
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -111,7 +227,7 @@ WantedBy=multi-user.target
 UNIT
  if ! apply "$w/new"; then rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json"; rmdir "$ARGO_DIR"; exit 1; fi
  if systemctl daemon-reload && systemctl enable --now sb-argo.service; then
-  msg OK '连接器已启动；公网可用性需测试'
+  if argo_wait; then msg OK '隧道实时健康检查通过'; else echo '警告：连接器已启动，但隧道实时健康尚未确认'; fi
   argo_info
  else err '连接器启动失败；入站已添加，请检查日志或使用删除功能'; exit 1; fi
 )
@@ -137,17 +253,25 @@ argo_remove(){
   edit '.inbounds |= map(select(.tag!="argo-vless-in"))' || return 1
  else confirm '删除本地连接器服务?' || return 0; fi
  systemctl disable --now sb-argo.service || return 1
- rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json"; rmdir "$ARGO_DIR" 2>/dev/null || :
+ rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json" "$ARGO_NET" || return 1; rmdir "$ARGO_DIR" "$ARGO_DROP" 2>/dev/null || :
  systemctl daemon-reload
 }
 argo_menu(){
  local n
  while true; do ui_title 'Argo 固定隧道管理'
- columns '01 安装连接器|02 配置固定隧道及 WS 入站|03 查看状态|04 查看分享链接' '05 启动连接器|06 停止连接器|07 实时日志|08 删除本地隧道|00 返回'
+ argo_health || :
+ columns '01 安装连接器|02 配置固定隧道及 WS 入站|03 查看隧道状态|04 查看分享链接|05 启动连接器|06 停止连接器|07 实时日志' '08 删除本地隧道|09 重启连接器|10 设置传输协议|11 设置 IP 版本|12 网络环境检测|13 公网节点测试|14 IPv4 自动修复'
+ echo '00 返回'
  read -rp "$(ui_prompt '请选择操作：')" n || return
- case $n in 1|01) argo_install_core;; 2|02) argo_setup;; 3|03) argo_status;; 4|04) argo_info;; 5|05) systemctl start sb-argo.service;; 6|06) systemctl stop sb-argo.service;; 7|07) journalctl -u sb-argo.service -n 30 -f;; 8|08) argo_remove;; 0|00) return;; *) err '无效选项';; esac
+ case $n in
+  1|01) argo_install_core;; 2|02) argo_setup;; 3|03) argo_status;; 4|04) argo_info;;
+  5|05) argo_start_checked start;; 6|06) systemctl stop sb-argo.service;; 7|07) journalctl -u sb-argo.service -n 30 -f;; 8|08) argo_remove;;
+  9|09) argo_start_checked restart;; 10) argo_network_set protocol;; 11) argo_network_set ip;; 12) argo_network_test;; 13) argo_public_test;; 14) argo_network_set repair;;
+  0|00) return;; *) err '无效选项';;
+ esac
  done
 }
+
 install_core(){
  env_preflight || return 1
  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl jq openssl iproute2 netcat-openbsd python3 procps || return 1
@@ -870,7 +994,8 @@ uninstall_service(){
    fi
   fi
  fi
- rm -f -- "$ARGO_UNIT" || return 1
+ rm -f -- "$ARGO_UNIT" "$ARGO_NET" || return 1
+ rmdir "$ARGO_DROP" 2>/dev/null || :
  if (( ! keep_cloud )); then rm -f -- /etc/apt/sources.list.d/sb-cloudflared.list || return 1; fi
  # Do not remove a signing key still referenced by another repository.
  if ! grep -RqsF /usr/share/keyrings/sb-cloudflare.gpg /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
