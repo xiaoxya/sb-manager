@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.18** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.19** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -379,3 +379,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.18 DNS 与 IPv6 管理
 
 主菜单 37 或 `sb dns`：查看 DNS 配置、检测 IPv4/IPv6 公网 HTTPS、自动推荐解析策略、手动设置 ipv4_only/prefer_ipv4/ipv6_only/prefer_ipv6、设置 local/UDP/TCP DNS、系统 DNS 解析测试及查看近期 sing-box DNS 错误、恢复原始 DNS 配置。首次修改保存 `/var/lib/sb-manager/dns-original.json`，沿用配置备份、校验与应用失败回滚机制。保留出站专用 resolver，不禁用系统 IPv6，不拦截直接请求 IPv6 地址。设置服务器仅替换唯一的 local-dns 标签所对应的服务器；不提供 DoH/DoT 或多服务器配置。恢复 DNS 段及默认 resolver，并恢复仍匹配的 resolve 规则策略。自动检测仅反映检测端点当前可达性，应用前需要确认。更新管理器不会主动改变 DNS 或重启服务。新功能尚未 VPS 实机测试。
+
+## v2.2.19 DNS 服务商预设及加密 DNS
+
+菜单 37 → 08 新增系统 DNS、Cloudflare、Google、Quad9、AdGuard、阿里云、DNSPod、自定义预设，支持 UDP/TCP/DoH/DoT/DoQ/DoH3（按预设限制未确认支持的组合）。自定义支持 IPv4/IPv6 地址、端口、TLS SNI、HTTPS 路径，不接受完整 URL；加密 DNS 使用证书验证及 IP 直连以避免引导解析循环。可保存备用服务器 sb-dns-secondary，菜单 11 手动交换主备，不提供自动故障转移。菜单 12 通过临时 sing-box 实例分别测试主备 HTTPS 连通及总耗时并显示 DNS 日志，不是纯 DNS RTT。配置应用沿用备份、语法校验及回滚流程；已有备用标签时拒绝重复添加。更新管理器不重启服务，不改变 DNS 设置。尚未实机验证各协议及服务商组合。
