@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.25
+VERSION=2.2.26
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -724,13 +724,28 @@ reality_test() ( local w key pub; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; key=$
 fix_rules(){ local f; f=$(mktemp); rules > "$f"; edit --slurpfile r "$f" '.http_clients=((.http_clients // [])|map(select(.tag!="rule-download")))+$r[0].http_clients|.route.default_http_client="rule-download"|.route.rule_set |= map(if .type=="remote" and (.http_client == null or .http_client == "rule-download") then del(.download_detour,.http_client) else . end)'; local rc=$?; rm -f "$f"; return "$rc"; }
 route_test() (
  w=''; pid=''
- local p domain expect actual code before logs domains relay='' direct_label relay_label rc status i color=0
+ local p domain expect actual code before logs domains relay='' direct_label relay_label rc status i color=0 mode final detected selected geo direct_default='直连' relay_default='中转'
  [[ -s $C ]] || { err '请先初始化服务'; exit 1; }
  need python3 jq curl ss sing-box || exit 1
  relay=$(relay_tag 2>/dev/null) || relay=''
- echo '按实际出站标签验证分流；地区为用户设置的显示别名，不是 IP 地理定位。'
- direct_label=$(ask '直连地区显示名称' '香港') || exit 1
- if [[ -n $relay ]]; then relay_label=$(ask "中转 $relay 地区显示名称" '台湾') || exit 1; else relay_label='未配置'; fi
+ final=$(jq -er '.route.final // .outbounds[0].tag' "$C") || exit 1
+ # Infer only recognized configurations, never assume arbitrary rules are smart.
+ detected=custom
+ if jq -e '[.route.rules[]?|select((.action//"route")=="route" or .action=="route-options")]|length==0' "$C" >/dev/null; then
+  if [[ $final == direct ]]; then detected=direct; else detected=global; fi
+ elif [[ -n $relay && $final == direct ]] && jq -e --arg r "$relay" 'any(.route.rules[]?; .outbound==$r and (((.rule_set//[])|if type=="array" then index("geosite-ai")!=null else .=="geosite-ai" end) or ((.domain_suffix//[])|if type=="array" then index("chatgpt.com")!=null else .=="chatgpt.com" end)))' "$C" >/dev/null; then detected=smart
+ fi
+ echo '检测模式：direct=全局直连/独立服务，global=默认出站，smart=预设智能分流，custom=仅检测不判定预期'
+ mode=$(ask '预期模式 direct/global/smart/custom' "$detected") || exit 1
+ case $mode in direct|global|custom) ;; smart) [[ -n $relay ]] || { err '没有预设中转标签'; exit 1; };; *) err '无效模式'; exit 1;; esac
+ # Geo lookup is optional, only samples the VPS direct public exit.
+ if confirm '查询本机直连公网地区（第三方 ipinfo.io）?'; then
+  geo=$(curl -4 --noproxy '*' -fsS --connect-timeout 3 --max-time 6 https://ipinfo.io/json 2>/dev/null | jq -er '.country|select(test("^[A-Z]{2}$"))' 2>/dev/null) || geo=''
+  case $geo in KR) direct_default=韩国;; HK) direct_default=香港;; TW) direct_default=台湾;; JP) direct_default=日本;; SG) direct_default=新加坡;; US) direct_default=美国;; CN) direct_default=中国大陆;; '') ;; *) direct_default=$geo;; esac
+ fi
+ echo '地区为出站显示别名；本机查询不代表逐站点真实出口。'
+ direct_label=$(ask '直连地区显示名称' "$direct_default") || exit 1
+ if [[ -n $relay ]]; then relay_label=$(ask "中转 $relay 地区显示名称" "$relay_default") || exit 1; else relay_label='未配置'; fi
  domains=$(ask '测试域名（空格分隔）' 'chatgpt.com api.openai.com claude.ai gemini.google.com grok.com www.binance.com www.tiktok.com github.com www.youtube.com api.ipify.org') || exit 1
  w=$(mktemp -d) || exit 1
  trap 'if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; fi; if [[ -n ${w:-} ]]; then rm -rf -- "$w"; fi' EXIT
@@ -746,14 +761,18 @@ route_test() (
  : > "$w/results"
  ui_title 'sing-box AI 智能分流测试工具'
  echo '真实 HTTPS 请求及出站日志检测 | 临时实例，不修改正式配置'
- echo 'PASS=实际出站符合预期且收到 HTTPS 响应；不代表网站业务可用'
+ printf '预期模式：%s | 默认出站：%s\n' "$mode" "$final"
+ echo 'PASS=实际出站符合预期且收到 HTTPS 响应；HTTP 4xx/5xx 单独提示'
  for domain in "${domain_list[@]}"; do
   [[ $domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && $domain == *.* ]] || continue
   domain=${domain,,}
+  case $mode in
+   direct) expect=direct;; global) expect=$final;; custom) expect=custom;; smart)
   case $domain in
    chatgpt.com|*.chatgpt.com|openai.com|*.openai.com|claude.ai|*.claude.ai|gemini.google.com|grok.com|*.grok.com|binance.com|*.binance.com|tiktok.com|*.tiktok.com) expect=${relay:-UNCONFIGURED};;
    github.com|www.youtube.com|youtube.com|api.ipify.org) expect=direct;;
    *) expect=custom;;
+  esac;;
   esac
   before=$(wc -l < "$w/log")
   rc=0
@@ -780,6 +799,7 @@ right=region
 gap=max(2,min(int(width),100)-2-cells(left)-cells(right))
 print(paint("["+status+"]",{"PASS":"32","FAIL":"31","TEST":"33"}[status])+" "+domain+" "*gap+paint(right,"34" if actual=="direct" else "32" if tag and actual==tag else "33"))
 if status!="PASS": print(f"       预期={expected} 实际={actual} HTTP={http} curl={rc}")
+elif http.startswith(("4","5")): print(paint(f"       HTTP {http}：网站响应异常或访问受限，分流仍通过","33"))
 PYROW
  done
  python3 - "$w/results" <<'PYSUM'
@@ -787,7 +807,9 @@ import sys,collections
 c=collections.Counter(l.split("\t",1)[0] for l in open(sys.argv[1]))
 print("-"*44)
 print(f"通过: {c['PASS']}  失败: {c['FAIL']}  自定义未判定: {c['TEST']}")
-print("预期为 AI/加密货币/TikTok 中转，其余指定站点直连；自定义策略可能不同。")
+warnings=sum(1 for l in open(sys.argv[1]) if l.split("\t")[4].startswith(("4","5")))
+print(f"HTTP 4xx/5xx 警告：{warnings}（不等于分流失败）")
+print("预期取自选择的模式；自定义规则及入站匹配可能不同。")
 print("地区仅为标签别名；未验证每个站点的真实公网出口 IP。")
 PYSUM
 )
