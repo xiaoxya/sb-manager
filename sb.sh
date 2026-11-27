@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.23
+VERSION=2.2.24
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -723,18 +723,74 @@ PYLINK
 reality_test() ( local w key pub; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; key=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") || exit 1; pub=$(public_key "$key") || exit 1; jq --arg pub "$pub" '.inbounds[]|select(.tag=="vless-reality-in")|{type:"vless",tag:"reality-test",server:"127.0.0.1",server_port:.listen_port,uuid:.users[0].uuid,flow:.users[0].flow,tls:{enabled:true,server_name:.tls.server_name,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:.tls.reality.short_id[0]}}}' "$C" > "$w/o" && probe "$w/o"; )
 fix_rules(){ local f; f=$(mktemp); rules > "$f"; edit --slurpfile r "$f" '.http_clients=((.http_clients // [])|map(select(.tag!="rule-download")))+$r[0].http_clients|.route.default_http_client="rule-download"|.route.rule_set |= map(if .type=="remote" and (.http_client == null or .http_client == "rule-download") then del(.download_detour,.http_client) else . end)'; local rc=$?; rm -f "$f"; return "$rc"; }
 route_test() (
- local w pid='' p=10895 domain expect actual code before logs domains; w=$(mktemp -d); trap '[[ -z $pid ]] || { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$w"' EXIT; trap 'exit 130' INT
- [[ -z $(ss -H -lnt "sport = :$p") ]] || exit 1
- jq --argjson p "$p" --arg cache "$w/cache.db" '.log={level:"debug"}|.inbounds=[{type:"mixed",tag:"route-test-in",listen:"127.0.0.1",listen_port:$p}]|.experimental={cache_file:{enabled:true,path:$cache}}' "$C" > "$w/config.json" || exit 1; check "$w/config.json" || exit 1; sing-box run -D "$w" -c "$w/config.json" > "$w/log" 2>&1 & pid=$!; for i in {1..45}; do kill -0 "$pid" || { cat "$w/log"; exit 1; }; [[ -n $(ss -H -lnt "sport = :$p") ]] && break; sleep 1; done
- [[ -n $(ss -H -lnt "sport = :$p") ]] || { cat "$w/log"; exit 1; }
- domains=$(ask '测试域名（空格分隔）' 'chatgpt.com api.openai.com claude.ai gemini.google.com binance.com tiktok.com github.com api.ipify.org') || exit 1
+ local w pid='' p domain expect actual code before logs domains relay='' direct_label relay_label rc status i color=0
+ [[ -s $C ]] || { err '请先初始化服务'; exit 1; }
+ need python3 jq curl ss sing-box || exit 1
+ relay=$(relay_tag 2>/dev/null) || relay=''
+ echo '按实际出站标签验证分流；地区为用户设置的显示别名，不是 IP 地理定位。'
+ direct_label=$(ask '直连地区显示名称' '香港') || exit 1
+ if [[ -n $relay ]]; then relay_label=$(ask "中转 $relay 地区显示名称" '台湾') || exit 1; else relay_label='未配置'; fi
+ domains=$(ask '测试域名（空格分隔）' 'chatgpt.com api.openai.com claude.ai gemini.google.com grok.com www.binance.com www.tiktok.com github.com www.youtube.com api.ipify.org') || exit 1
+ w=$(mktemp -d) || exit 1
+ trap '[[ -z $pid ]] || { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$w"' EXIT
+ trap 'exit 130' INT; trap 'exit 143' TERM
+ for p in 10895 10896 10897; do [[ -z $(ss -H -lnt "sport = :$p") ]] && break; done
+ [[ -z $(ss -H -lnt "sport = :$p") ]] || { err '测试端口均被占用'; exit 1; }
+ jq --argjson p "$p" --arg cache "$w/cache.db" '.log={level:"debug"}|.inbounds=[{type:"mixed",tag:"route-test-in",listen:"127.0.0.1",listen_port:$p}]|.experimental={cache_file:{enabled:true,path:$cache}}' "$C" > "$w/config.json" || exit 1
+ check "$w/config.json" || exit 1
+ sing-box run -D "$w" -c "$w/config.json" > "$w/log" 2>&1 & pid=$!
+ for i in {1..45}; do kill -0 "$pid" 2>/dev/null || { err '临时测试实例启动失败'; exit 1; }; [[ -n $(ss -H -lnt "sport = :$p") ]] && break; sleep 1; done
+ [[ -n $(ss -H -lnt "sport = :$p") ]] || { err '测试端口启动超时'; exit 1; }
  local -a domain_list; read -ra domain_list <<< "$domains"
- for domain in "${domain_list[@]}"; do
- [[ $domain =~ ^[A-Za-z0-9.-]+$ ]] || continue
- expect=custom
- before=$(wc -l < "$w/log"); code=$(curl -sS --noproxy '' --proxy "socks5h://127.0.0.1:$p" --max-time 15 -o /dev/null -w '%{http_code}' "https://$domain/" 2>/dev/null || :); sleep .2; logs=$(tail -n "+$((before+1))" "$w/log"); actual=$(grep -F "$domain:443" <<< "$logs" | sed -n 's/.*outbound\/[^[]*\[\([^]]*\)\]: outbound connection to.*/\1/p' | head -1); printf '%-36s policy=%-12s actual=%-12s HTTP=%s\n' "$domain" "$expect" "${actual:-unknown}" "${code:-000}"
+ : > "$w/results"
+ ui_title 'sing-box AI 智能分流测试工具'
+ echo '真实 HTTPS 请求及出站日志检测 | 临时实例，不修改正式配置'
+ echo 'PASS=实际出站符合预期且收到 HTTPS 响应；不代表网站业务可用'
+ for domain in "${}domain_list[@]}"; do
+  [[ $domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && $domain == *.* ]] || continue
+  domain=${}domain,,}
+  case $domain in
+   chatgpt.com|*.chatgpt.com|openai.com|*.openai.com|claude.ai|*.claude.ai|gemini.google.com|grok.com|*.grok.com|binance.com|*.binance.com|tiktok.com|*.tiktok.com) expect=${}relay:-UNCONFIGURED};;
+   github.com|www.youtube.com|youtube.com|api.ipify.org) expect=direct;;
+   *) expect=custom;;
+  esac
+  before=$(wc -l < "$w/log")
+  rc=0
+  code=$(curl -sS --noproxy '' --proxy "socks5h://127.0.0.1:$p" --connect-timeout 8 --max-time 15 -o /dev/null -w '%{http_code}' "https://$domain/" 2>/dev/null) || rc=$?
+  logs=$(tail -n "+$((before+1))" "$w/log")
+  actual=$(grep -F "$domain:443" <<< "$logs" | sed -n 's/.*outbound\/[^[]*\[\([^]]*\)\]: outbound connection to.*/\1/p' | head -1)
+  status=FAIL
+  if [[ -n $actual && $rc == 0 && $code =~ ^[1-5][0-9][0-9]$ ]]; then
+   if [[ $expect == custom ]]; then status=TEST; elif [[ $expect == "$actual" ]]; then status=PASS; fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$domain" "$expect" "${}actual:-unknown}" "${}code:-000}" "$rc" >> "$w/results"
+  # Stream each result immediately; renderer counts wide CJK cells before adding ANSI.
+  ui_color && color=1
+  python3 - "$w/results" "$direct_label" "$relay_label" "$relay" "$color" "$(tput cols 2>/dev/null || echo 80)" <<'PYROW'
+import sys,unicodedata as u
+f,d,r,tag,color,width=sys.argv[1:]
+status,domain,expected,actual,http,rc=open(f).read().splitlines()[-1].split("\t")
+def clean(s): return "".join(c for c in s if c.isprintable())
+def cells(s): return sum(0 if u.combining(c) else 2 if u.east_asian_width(c) in "WF" else 1 for c in s)
+def paint(s,c): return "\033["+c+"m"+s+"\033[0m" if color=="1" else s
+region=clean(d if actual=="direct" else r if tag and actual==tag else actual)
+left=f"[{status}] {domain}"
+right=region
+gap=max(2,min(int(width),100)-2-cells(left)-cells(right))
+print(paint("["+status+"]",{"PASS":"32","FAIL":"31","TEST":"33"}[status])+" "+domain+" "*gap+paint(right,"34" if actual=="direct" else "32" if tag and actual==tag else "33"))
+if status!="PASS": print(f"       预期={expected} 实际={actual} HTTP={http} curl={rc}")
+PYROW
  done
+ python3 - "$w/results" <<'PYSUM'
+import sys,collections
+c=collections.Counter(l.split("\t",1)[0] for l in open(sys.argv[1]))
+print("-"*44)
+print(f"通过: {c['PASS']}  失败: {c['FAIL']}  自定义未判定: {c['TEST']}")
+print("预期为 AI/加密货币/TikTok 中转，其余指定站点直连；自定义策略可能不同。")
+print("地区仅为标签别名；未验证每个站点的真实公网出口 IP。")
+PYSUM
 )
+
 monitor(){ local filter; filter=$(ask '日志筛选（all/ai/crypto/tiktok/anytls/relay-client）' all); case $filter in relay-client|hk-relay) filter="relay-client|hk-relay";; ai) filter='openai|chatgpt|claude|anthropic|gemini|grok|perplexity|aistudio';; crypto) filter='binance|okx|bybit|bitget|metamask|etherscan';; tiktok) filter='tiktok|byteoversea';; all) filter='.';; esac; journalctl -u sing-box -n 0 -f -o cat | grep --line-buffered -Ei "$filter"; }
 restore(){ local f; ls -1d "$B"/* 2>/dev/null; f=$(ask '输入完整备份目录' ''); [[ -f $f/sing-box/config.json ]] || return 1; confirm '恢复 JSON（证书需与备份一致）?' && apply "$f/sing-box/config.json"; }
 change_port(){ local tag p; jq -r '.inbounds[]|"\(.tag) \(.listen_port)"' "$C"; tag=$(ask '入站标签' anytls-in); jq -e --arg t "$tag" 'any(.inbounds[];.tag==$t)' "$C" >/dev/null || return 1; p=$(ask '内部监听端口' ''); port "$p" || return 1; edit --arg t "$tag" --argjson p "$((10#$p))" '(.inbounds[]|select(.tag==$t)|.listen_port)=$p'; }
