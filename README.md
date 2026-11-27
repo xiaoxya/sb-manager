@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.10** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.11** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -349,3 +349,9 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.10 出站分享链接优先导出
 
 菜单 10 → 09 或 `sb export-outbound` 支持单个或全部出站。优先生成 VLESS REALITY/TLS TCP、AnyTLS、Hysteria2、Shadowsocks/SS2022 分享链接，并使用内置导入解析器进行配置往返一致性检查；无法完整转换的节点（含 Snell、direct 或额外高级字段）回退至原生 JSON。输入路径前缀后按需生成 `.txt`（每行一条链接）及 `.json`（仅回退节点，格式 `{"outbounds":[...]}`）。文件权限 600，不覆盖已有文件，可确认后在终端显示分享链接。导出含认证信息，请妥善保管。默认链接格式的客户端兼容性尚未实机验证。导出不修改代理配置或重启服务。
+
+## v2.2.11 环境检测与 Argo 固定隧道
+
+`sb env` 查看操作系统、AMD64/ARM64 架构、内核、虚拟化、systemd、软件依赖、内存磁盘及 BBR 状态。核心安装前执行 Debian/Ubuntu、软件包架构及 systemd 检查。主菜单显示系统及 Argo 状态。
+
+主菜单 36 或 `sb argo` 管理 Cloudflare 固定隧道。需要在 Cloudflare 控制台预先创建 remotely-managed Tunnel、获取 connector token，并添加公网 hostname 路由到 HTTP `http://127.0.0.1:18080`（或自行选择的本地端口）。脚本通过官方 APT 仓库安装 cloudflared，创建独立 VLESS WS 回环入站、随机 UUID、WS 路径及 `sb-argo.service`，令牌保存在 `/etc/sb-argo/token`（600）。菜单可查看链接、启停、日志及删除本地配置。删除不会删除云端隧道。普通 HTTP Tunnel 不承载 REALITY、HY2、AnyTLS、Snell 或 SS 原生协议。本版不含临时 Quick Tunnel、云端 DNS 自动创建或 WS 出站分享链接导入。应用入站会重启 sing-box；连接器启动失败时可能保留已添加入站，需检查日志或删除。尚未进行 ARM64/Argo 实机验证。
