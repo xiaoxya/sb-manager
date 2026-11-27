@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.4** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.5** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -322,4 +322,10 @@ journalctl -u sing-box -n 50 --no-pager
 
 ## v2.2.4 Snell 支持
 
-新增 Snell 入站（服务端 v5/v6）和出站（客户端 v4/v6）。初始化三种模式时可选启用，也可在已有服务器通过 `sb add-snell`（主菜单 36）追加 Snell 入站。默认 TCP 8443，需自行开放防火墙及 NAT 映射。节点信息显示 PSK 等连接参数，请勿公开。添加出站时选择 `snell`，配置 PSK、版本等参数，测试通过后再应用。v5 服务端可使用 v4 兼容客户端；不支持 v5 QUIC 模式。需要支持 Snell 的 sing-box 1.14.x 核心。尚未完成实机验证；分享链接导入尚未实现。
+新增 Snell 入站（服务端 v5/v6）和出站（客户端 v4/v6）。初始化三种模式时可选启用，也可在已有服务器通过 `sb add-snell`（主菜单 36）追加 Snell 入站。默认 TCP 8443，需自行开放防火墙及 NAT 映射。节点信息显示 PSK 等连接参数，请勿公开。添加出站时选择 `snell`，配置 PSK、版本等参数，测试通过后再应用。v5 服务端可使用 v4 兼容客户端；不支持 v5 QUIC 模式。需要支持 Snell 的 sing-box 1.14.x 核心。尚未完成实机验证；分享链接导入见 v2.2.5。
+
+## v2.2.5 分享链接导入
+
+进入主菜单 10 → 08，或执行 `sb import-node`（别名 `sb import-outbound`）。输入唯一出站标签，再粘贴单条链接；认证信息不回显。支持 VLESS REALITY/TLS TCP/RAW、AnyTLS、Hysteria2 (`hy2://` / `hysteria2://`)、Shadowsocks/SS2022 (`ss://`，无插件)。支持 URL 编码、Base64 认证、IPv6 方括号地址及 HY2 Salamander 混淆。非 TCP VLESS、订阅链接、SS 插件和 Snell 分享链接暂不支持；Snell 仍可手动配置。
+
+AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验证且未修正，会要求风险确认。VLESS 拒绝关闭证书验证。解析结果隐藏密码和 UUID。可选填写预期出口 IP，连接测试成功后才提示应用，沿用配置检查、备份及失败回滚流程。新增出站不会自动修改分流规则。实际连接兼容性须在 VPS 验证。
