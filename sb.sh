@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.30
+VERSION=2.2.31
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1192,6 +1192,7 @@ uninstall_service(){
  read -r -p "$(ui_prompt '确认彻底卸载请输入 PURGE：')" answer || return 2
  [[ $answer == PURGE ]] || { echo '已取消卸载'; return 2; }
  [[ -f /etc/apt/sources.list.d/sb-cloudflared.list || -f /var/lib/sb-manager/cloudflared-installed ]] && cloud_owned=1
+ sec_remove purge || return 1
  stop_managed_unit sb-argo.service && stop_managed_unit sing-box.service || { err '停止服务失败，未继续删除'; return 1; }
  # Do not remove a connector used by another service or manually running process.
  if command -v cloudflared >/dev/null || dpkg-query -W cloudflared >/dev/null 2>&1; then
@@ -1341,7 +1342,8 @@ sing-box Manager v$VERSION
   argo-stability         Argo 稳定性诊断
   dns                    DNS 与 IPv6 管理（含系统级 IPv6 启停）
   cert                   TLS 证书管理
-  01-38                  对应主菜单编号
+  security               REALITY 安全防护管理
+  01-39                  对应主菜单编号
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
@@ -2056,6 +2058,161 @@ acme_menu(){
  esac
  done
 }
+# Dedicated Fail2ban jail. Only REALITY invalid handshake messages are eligible.
+SEC_JAIL=sb-reality
+SEC_FILTER=/etc/fail2ban/filter.d/sb-reality.conf
+SEC_CONF=/etc/fail2ban/jail.d/sb-reality.local
+SEC_STATE=/var/lib/sb-manager/security.json
+sec_ports(){
+ [[ -s $C ]] || return 1
+ jq -er '[.inbounds[]?|select(.type=="vless" and .tls.reality.enabled==true)|.listen_port]|unique|select(length>0)|map(tostring)|join(",")' "$C"
+}
+sec_ip(){
+ python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))' "$1" 2>/dev/null
+}
+sec_status(){
+ echo 'REALITY TCP 端口：'
+ sec_ports || :
+ if [[ -s $SEC_STATE ]]; then jq . "$SEC_STATE"; fi
+ if command -v fail2ban-client >/dev/null; then
+  fail2ban-client status "$SEC_JAIL" || :
+ else echo '未安装 Fail2ban'; fi
+}
+sec_stats(){
+ local m
+ m=$(ask '统计最近分钟数（1-1440）' 60) || return 1
+ [[ $m =~ ^[0-9]{1,4}$ ]] && ((10#$m>=1 && 10#$m<=1440)) || return 1
+ journalctl -u sing-box.service --since "$((10#$m)) minutes ago" --no-pager -o cat |
+ python3 -c 'import re,sys,ipaddress,collections
+c=collections.Counter()
+for l in sys.stdin:
+ m=re.search(r"inbound/vless\[[^]]+\]: process connection from (\[[0-9a-fA-F:]+\]|[0-9.]+):\d+: TLS handshake: REALITY: processed invalid connection\s*$",l)
+ if m:
+  try: c[str(ipaddress.ip_address(m.group(1).strip("[]")))]+=1
+  except ValueError: pass
+for ip,n in c.most_common(30): print(f"{n:6d}  {ip}")
+print(f"无效握手日志总数：{sum(c.values())}；不是攻击次数。")'
+}
+sec_install(){
+ apt-get install -y fail2ban nftables python3-systemd || return 1
+ systemctl enable --now fail2ban.service
+}
+sec_configure(){
+ local enabled=$1 ports w tries window ban ignore current sship='' tag
+ need fail2ban-client fail2ban-regex nft jq python3 || return 1
+ ports=$(sec_ports) || { err '没有 REALITY TCP 入站'; return 1; }
+ [[ $ports =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+ # Never apply a jail to an SSH port, even if a custom config claims it.
+ local sshports
+ sshports=$(ss -H -lntp | awk '/sshd/ {n=split($4,a,":"); print a[n]}' | sort -u)
+ if [[ -n $sshports ]]; then
+  while IFS= read -r tag; do
+   if [[ ",$ports," == *",$tag,"* ]]; then err 'REALITY 端口与 SSH 监听重叠，拒绝启用'; return 1; fi
+  done <<< "$sshports"
+ fi
+ if [[ -e $SEC_CONF || -e $SEC_FILTER ]]; then
+  [[ -s $SEC_STATE ]] || { err '存在同名未知防护配置，拒绝覆盖'; return 1; }
+ fi
+ w=$(mktemp -d) || return 1
+ if [[ -s $SEC_STATE ]]; then
+  tries=$(jq -r '.maxretry' "$SEC_STATE"); window=$(jq -r '.findtime' "$SEC_STATE"); ban=$(jq -r '.bantime' "$SEC_STATE"); ignore=$(jq -r '.ignoreip' "$SEC_STATE")
+ else tries=20; window=60; ban=600; ignore='127.0.0.0/8 ::1'; fi
+ if [[ -n ${SSH_CONNECTION:-} ]]; then
+  sship=${SSH_CONNECTION%% *}; sship=$(sec_ip "$sship") || sship=''
+  [[ -z $sship ]] || ignore="$ignore $sship"
+ fi
+ if [[ $enabled == tune ]]; then
+  tries=$(ask '无效握手次数阈值' "$tries") || { rm -rf "$w"; return 1; }
+  window=$(ask '统计窗口（秒）' "$window") || { rm -rf "$w"; return 1; }
+  ban=$(ask '封禁时长（秒）' "$ban") || { rm -rf "$w"; return 1; }
+  enabled=false
+  if [[ -s $SEC_STATE ]]; then enabled=$(jq -r '.enabled' "$SEC_STATE"); fi
+ elif [[ $enabled == whitelist ]]; then
+  ignore=$(ask '白名单 IP/CIDR（空格分隔）' "$ignore") || { rm -rf "$w"; return 1; }
+  enabled=false
+  if [[ -s $SEC_STATE ]]; then enabled=$(jq -r '.enabled' "$SEC_STATE"); fi
+ fi
+ if ! [[ $tries =~ ^[1-9][0-9]{0,3}$ && $window =~ ^[1-9][0-9]{0,5}$ && $ban =~ ^[1-9][0-9]{0,6}$ && ( $enabled == true || $enabled == false ) ]]; then rm -rf "$w"; err '参数无效'; return 1; fi
+ ignore=$(python3 -c 'import ipaddress,sys
+a=["127.0.0.0/8","::1"]+sys.argv[1].split()
+print(" ".join(dict.fromkeys(str(ipaddress.ip_network(x,strict=False)) for x in a)))' "$ignore" 2>/dev/null) || { rm -rf "$w"; err '白名单无效'; return 1; }
+ if [[ -n $sship ]]; then ignore="$ignore $sship"; fi
+ cat > "$w/filter" <<'FILTER'
+# Managed by sb-manager
+[Definition]
+failregex = ^.*\binbound/vless\[[^]]+\]: process connection from <HOST>:\d+: TLS handshake: REALITY: processed invalid connection\s*$
+ignoreregex =
+journalmatch = _SYSTEMD_UNIT=sing-box.service
+FILTER
+ cat > "$w/jail" <<JAIL
+# Managed by sb-manager
+[$SEC_JAIL]
+enabled = $enabled
+filter = sb-reality
+backend = systemd
+usedns = no
+port = $ports
+protocol = tcp
+banaction = nftables-multiport
+maxretry = $tries
+findtime = $window
+bantime = $ban
+ignoreip = $ignore
+JAIL
+ echo "REALITY TCP 端口 $ports；阈值 $tries / $window 秒；封禁 $ban 秒；启用=$enabled"
+ echo "白名单：$ignore"
+ echo '仅限制匹配的 REALITY TCP 端口；不封禁 EOF、普通超时或 QUIC 取消。启用前确认自己的客户端已加入白名单。'
+ confirm '应用独立 Fail2ban 防护配置？' || { rm -rf "$w"; return 0; }
+ [[ ! -e $SEC_FILTER ]] || cp -a "$SEC_FILTER" "$w/oldfilter" || { rm -rf "$w"; return 1; }
+ [[ ! -e $SEC_CONF ]] || cp -a "$SEC_CONF" "$w/oldjail" || { rm -rf "$w"; return 1; }
+ if install -m 644 "$w/filter" "$SEC_FILTER" && install -m 644 "$w/jail" "$SEC_CONF" && fail2ban-client -t && fail2ban-client reload; then
+  install -d -m 700 /var/lib/sb-manager
+  jq -n --argjson enabled "$enabled" --argjson maxretry "$tries" --argjson findtime "$window" --argjson bantime "$ban" --arg ignoreip "$ignore" --arg ports "$ports" '{$enabled,$maxretry,$findtime,$bantime,$ignoreip,$ports}' > "$SEC_STATE"
+  local rc=$?
+  rm -rf "$w"; return "$rc"
+ fi
+ if [[ -e $w/oldfilter ]]; then cp -a "$w/oldfilter" "$SEC_FILTER"; else rm -f "$SEC_FILTER"; fi
+ if [[ -e $w/oldjail ]]; then cp -a "$w/oldjail" "$SEC_CONF"; else rm -f "$SEC_CONF"; fi
+ fail2ban-client reload || :
+ rm -rf "$w"; err '防护配置应用失败，已尝试恢复'
+}
+sec_manual(){
+ local op=$1 ip
+ ip=$(ask 'IP 地址' '') || return 1
+ ip=$(sec_ip "$ip") || { err 'IP 无效'; return 1; }
+ if [[ $op == banip ]]; then
+  [[ -s $SEC_STATE ]] || return 1
+  python3 -c 'import ipaddress,sys
+a=ipaddress.ip_address(sys.argv[1])
+assert not a.is_loopback and not any(a in ipaddress.ip_network(x,strict=False) for x in sys.argv[2].split())' "$ip" "$(jq -r '.ignoreip' "$SEC_STATE")" 2>/dev/null || { err '拒绝封禁白名单地址'; return 1; }
+  if [[ -n ${SSH_CONNECTION:-} && $ip == "${SSH_CONNECTION%% *}" ]]; then err '拒绝封禁当前 SSH 来源'; return 1; fi
+ fi
+ confirm "执行 $op $ip（仅本工具 REALITY jail）?" || return 0
+ fail2ban-client set "$SEC_JAIL" "$op" "$ip"
+}
+sec_remove(){
+ [[ -s $SEC_STATE ]] || { echo '无本工具防护记录，不删除未知配置'; return 0; }
+ if [[ "${1:-}" != purge ]]; then confirm '删除独立 REALITY 防护配置并解除其封禁？保留其他 Fail2ban jail 和软件包' || return 0; fi
+ if command -v fail2ban-client >/dev/null && systemctl is-active --quiet fail2ban.service; then
+  if fail2ban-client status "$SEC_JAIL" >/dev/null 2>&1; then fail2ban-client stop "$SEC_JAIL" || return 1; fi
+ fi
+ rm -f -- "$SEC_CONF" "$SEC_FILTER" || return 1
+ if command -v fail2ban-client >/dev/null && systemctl is-active --quiet fail2ban.service; then fail2ban-client reload || return 1; fi
+ rm -f -- "$SEC_STATE"
+}
+security_menu(){
+ local n
+ while true; do
+ ui_title '安全防护管理'
+ columns '01 安全防护状态|02 异常 IP 统计|03 安装 Fail2ban|04 启用自动防护|05 停止自动防护|06 设置防护阈值' '07 查看封禁列表|08 手动封禁 IP|09 解除 IP 封禁|10 白名单管理|11 实时防护日志|12 卸载安全防护'
+ echo '00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in
+  1|01) sec_status;; 2|02) sec_stats;; 3|03) sec_install;; 4|04) sec_configure true;; 5|05) sec_configure false;; 6|06) sec_configure tune;;
+  7|07) fail2ban-client status "$SEC_JAIL";; 8|08) sec_manual banip;; 9|09) sec_manual unbanip;; 10) sec_configure whitelist;; 11) journalctl -u fail2ban.service -n 30 -f;; 12) sec_remove;; 0|00) return;; *) err '无效选项';;
+ esac
+ done
+}
 manager_status(){
  local st core final mode
  printf '系统：%s | 架构：%s | 虚拟化：%s\n' "$(env_os)" "$(env_arch)" "$(virt)"
@@ -2120,7 +2277,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 功能菜单（左）|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|28 分流规则管理|29 智能分流测试|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|17 时间同步|18 系统诊断' '◆ 功能菜单（右）|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|27 开机启动|30 实时流量监控|11 修复规则下载|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|35 更新管理器|36 Argo 隧道管理|37 DNS 与 IPv6 管理|38 TLS 证书管理'
+ columns '◆ 功能菜单（左）|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|28 分流规则管理|29 智能分流测试|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|17 时间同步|18 系统诊断|19 前台调试' '◆ 功能菜单（右）|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|27 开机启动|30 实时流量监控|11 修复规则下载|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|35 更新管理器|36 Argo 隧道管理|37 DNS 与 IPv6 管理|38 TLS 证书管理|39 安全防护管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -2143,6 +2300,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; 39|security) security_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
