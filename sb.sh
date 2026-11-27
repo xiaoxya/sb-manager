@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.5
+VERSION=2.2.6
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -502,6 +502,127 @@ route_import(){ local f; policy_normal || return 1; f=$(ask '导入文件路径'
  confirm '替换当前活动分流规则及规则集？保留本机 DNS/出站，不导入禁用规则' || return 0; edit --slurpfile p "$f" '.route.rules=$p[0].route.rules|.route.rule_set=$p[0].route.rule_set|.route.final=$p[0].route.final'; }
 add_preset(){ local n name tag target url w; policy_normal || return 1; ui_title '预设规则集管理'; columns '01 AI 全部|02 OpenAI|03 Claude|04 Gemini|05 Crypto 全部|06 Binance|07 OKX|08 Web3|09 TikTok|10 Netflix|11 YouTube|12 Disney+|13 Spotify|14 Twitch' '15 Telegram|16 Twitter/X|17 Discord|18 GitHub|19 Google|20 Microsoft|21 Apple|22 Cloudflare|23 国外游戏|24 Speedtest|25 广告拦截|26 中国大陆域名|27 中国大陆IP'; echo '支持逗号多选；每个规则集先下载检测'; n=$(ask '编号' '') || return 1; target=$(route_target) || return 1; local -a names=(none 'category-ai-!cn' openai anthropic google-gemini category-cryptocurrency binance okx web3 tiktok netflix youtube disney spotify twitch telegram twitter discord github google microsoft apple cloudflare category-games-!cn speedtest category-ads-all cn cn); local -a picks; IFS=, read -ra picks <<< "$n"; for n in "${picks[@]}"; do [[ $n =~ ^[0-9]{1,2}$ ]] || return 1; n=$((10#$n)); ((n>=1 && n<=27)) || return 1; name=${names[n]}; tag="preset-$name"; url="$BASE/$name.srs"; if ((n==27)); then tag=preset-geoip-cn; url="${BASE%/geosite}/geoip/cn.srs"; fi; if ! curl -fsSL --max-time 25 -o /dev/null "$url"; then err "上游规则集不可用: $name，跳过"; continue; fi; confirm "添加 $tag → $target?" || continue; edit --arg tag "$tag" --arg url "$url" --arg t "$target" '.http_clients=((.http_clients // [])|if any(.[];.tag=="rule-download") then . else .+[{tag:"rule-download"}] end)|.route.default_http_client=(.route.default_http_client // "rule-download")|.route.rule_set=((.route.rule_set // [])|if any(.[];.tag==$tag) then . else .+[{type:"remote",tag:$tag,format:"binary",url:$url,update_interval:"24h"}] end)|.route.rules |= (([to_entries[]|select(.value.action=="resolve")|.key][0] // length) as $i | .[:$i]+[({rule_set:[$tag]}+(if $t=="reject" then {action:"reject"} else {action:"route",outbound:$t} end))]+.[$i:])' || return 1; done; }
 route_manage(){ local n; [[ -s $C ]] || return 1; policy_ready || return 1; while true; do ui_title '分流规则管理'; jq -r '"默认出站: \(.route.final) | 活动规则: \(.route.rules|length)"' "$C"; columns '01 查看规则|02 添加/修改/删除/排序规则|05 启用/禁用规则|07 添加预设规则集|08 自定义规则集管理' '13 设置默认出站|14 切换分流模式|15 测试域名/IP|16 实时日志|17 导入配置|18 导出配置|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) route_list; jq '.disabled' "$POLICY";; 2|02|8|08) policy_normal && legacy_route_manage;; 5|05) rule_toggle;; 7|07) add_preset;; 13) policy_normal && set_final;; 14) mode_switch;; 15) route_test;; 16) monitor;; 17) route_import;; 18) route_export;; 0|00) return;; esac; done; }
+# Append/remove only the selected inbound; never regenerate other credentials.
+inbound_list(){ jq -r '.inbounds[]|[.tag,.type,(.listen_port // "-")]|@tsv' "$C"; }
+inbound_add() (
+ local w type tag p pw sni cp kp keys priv uuid sid target
+ [[ -s $C ]] || { err '请先安装服务'; exit 1; }
+ need jq openssl sing-box || exit 1
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ inbound_list
+ type=$(ask '协议 hysteria2/anytls/vless/shadowsocks/snell' "${1:-anytls}") || exit 1
+ case $type in hysteria2) p=443;; anytls) p=59007;; vless) p=443;; shadowsocks) p=18834;; snell) p=8443;; *) err '不支持的协议'; exit 1;; esac
+ tag=$(ask '新入站唯一标签' "$type-in") || exit 1
+ [[ $tag =~ ^[A-Za-z0-9_.-]+$ ]] || { err '标签无效'; exit 1; }
+ jq -e --arg t "$tag" 'any(.inbounds[];.tag==$t)' "$C" >/dev/null && { err '标签重复'; exit 1; }
+ if [[ $type == snell ]]; then
+  snell_inbound "$C" "$w/raw" || exit 1
+  jq --arg t "$tag" '.inbounds[-1].tag=$t' "$w/raw" > "$w/new" || exit 1
+ else
+  p=$(ask '内部监听端口' "$p") || exit 1; port "$p" || exit 1; p=$((10#$p))
+  # HY2 uses UDP; AnyTLS/VLESS use TCP; SS uses both.
+  if jq -e --argjson p "$p" --arg t "$type" 'any(.inbounds[]; .listen_port==$p and (if $t=="hysteria2" then (.type!="anytls" and .type!="vless" and .type!="snell") elif $t=="shadowsocks" then true else .type!="hysteria2" end))' "$C" >/dev/null; then err '监听端口冲突'; exit 1; fi
+  case $type in
+   hysteria2|anytls)
+    cp=$(jq -r '[.inbounds[]|select(.tls.certificate_path != null and .tls.key_path != null)|.tls.certificate_path][0] // empty' "$C")
+    kp=$(jq -r '[.inbounds[]|select(.tls.certificate_path != null and .tls.key_path != null)|.tls.key_path][0] // empty' "$C")
+    sni=$(ask 'TLS SNI' "$(jq -r '[.inbounds[]|select(.tls.certificate_path != null and .tls.key_path != null)|.tls.server_name][0] // "proxy.example.com"' "$C")") || exit 1
+    [[ $sni =~ ^[A-Za-z0-9.-]+$ ]] || exit 1
+    if [[ -z $cp && -z $kp ]]; then
+     # Keep existing certificates untouched, including legacy layouts.
+     local cd="/etc/sing-box/cert/inbound-$tag"; [[ ! -e $cd ]] || { err '证书目录已存在，请检查后重试'; exit 1; }
+     mkdir -p "$cd" || exit 1
+     cp="$cd/fullchain.pem"; kp="$cd/server.key"
+     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 -subj "/CN=$sni" -addext "subjectAltName=DNS:$sni" -keyout "$kp" -out "$cp" || exit 1
+     local u g; u=$(systemctl show sing-box -p User --value); u=${u:-root}; g=$(systemctl show sing-box -p Group --value); g=${g:-$(id -gn "$u")}
+     chown root:"$g" "$cd" "$kp" "$cp" && chmod 750 "$cd" && chmod 640 "$kp" && chmod 644 "$cp" || exit 1
+    fi
+    [[ -s $cp && -s $kp ]] || { err '现有证书不完整，拒绝覆盖'; exit 1; }
+    pw=$(openssl rand -hex 24) || exit 1
+    jq --arg t "$tag" --arg type "$type" --argjson p "$p" --arg pw "$pw" --arg s "$sni" --arg cp "$cp" --arg kp "$kp" '.inbounds += [{type:$type,tag:$t,listen:"0.0.0.0",listen_port:$p,users:[{name:"client",password:$pw}],tls:{enabled:true,server_name:$s,certificate_path:$cp,key_path:$kp}}]' "$C" > "$w/new" || exit 1;;
+   vless)
+    target=$(ask 'REALITY TLS 目标域名' www.apple.com) || exit 1
+    [[ $target =~ ^[A-Za-z0-9.-]+$ ]] || exit 1
+    keys=$(sing-box generate reality-keypair) || exit 1; priv=$(awk '/PrivateKey/{print $NF}' <<< "$keys"); [[ -n $priv ]] || exit 1
+    uuid=$(sing-box generate uuid) || exit 1; sid=$(openssl rand -hex 8) || exit 1
+    jq --arg t "$tag" --argjson p "$p" --arg s "$target" --arg k "$priv" --arg u "$uuid" --arg sid "$sid" '.inbounds += [{type:"vless",tag:$t,listen:"0.0.0.0",listen_port:$p,users:[{name:"client",uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$s,reality:{enabled:true,handshake:{server:$s,server_port:443},private_key:$k,short_id:[$sid]}}}]' "$C" > "$w/new" || exit 1;;
+   shadowsocks)
+    pw=$(openssl rand -base64 16) || exit 1
+    jq --arg t "$tag" --argjson p "$p" --arg k "$pw" '.inbounds += [{type:"shadowsocks",tag:$t,listen:"0.0.0.0",listen_port:$p,method:"2022-blake3-aes-128-gcm",password:$k}]' "$C" > "$w/new" || exit 1;;
+  esac
+ fi
+ confirm '仅添加该入站，保留其他配置；应用时将重启服务，继续?' || exit 0
+ apply "$w/new" && info
+)
+inbound_delete(){
+ local t
+ [[ -s $C ]] || return 1
+ inbound_list
+ t=$(ask '待删除入站标签' '') || return 1
+ jq -e --arg t "$t" 'any(.inbounds[];.tag==$t)' "$C" >/dev/null || { err '入站不存在'; return 1; }
+ [[ $(jq '.inbounds|length' "$C") -gt 1 ]] || { err '至少保留一个入站'; return 1; }
+ if jq -e --arg t "$t" 'del(.inbounds[]|select(.tag==$t))|any(..|strings;.==$t)' "$C" >/dev/null || { [[ -s $POLICY ]] && jq -e --arg t "$t" 'any(..|strings;.==$t)' "$POLICY" >/dev/null; }; then err '入站仍被规则或其他配置引用，请先解除引用'; return 1; fi
+ confirm "仅删除 $t（保留证书及其他节点，服务将重启）?" || return 0
+ edit --arg t "$t" '.inbounds |= map(select(.tag!=$t))'
+}
+service_menu(){
+ local n
+ while true; do
+  ui_title '安装服务 / 入站管理'
+  columns '01 独立代理（首次安装）|02 入口中转（首次安装）|03 落地服务（首次安装）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|00 返回'
+  read -rp "$(ui_prompt '请选择操作：')" n || return
+  case $n in
+   1|01|2|02|3|03)
+    if [[ -s $C ]] && jq -e '(.inbounds // [])|length>0' "$C" >/dev/null 2>&1; then err '已有入站，请使用05/06；拒绝重新初始化以保护节点'; continue; fi
+    case $n in 1|01) init_role standalone;; 2|02) init_role entry;; *) init_role landing;; esac;;
+   4|04) [[ -s $C ]] && inbound_list;;
+   5|05) inbound_add;;
+   6|06) inbound_delete;;
+   0|00) return;;
+   *) err '无效选项';;
+  esac
+ done
+}
+BBR_CONF=/etc/sysctl.d/99-sb-bbr.conf
+BBR_STATE=/var/lib/sb-manager/bbr-original
+bbr_status(){
+ sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control net.core.default_qdisc 2>/dev/null
+}
+bbr_enable(){
+ local old q tmp
+ if [[ -e $BBR_CONF || -e $BBR_STATE ]]; then err '已有 BBR 管理记录，请先查看或恢复'; return 1; fi
+ old=$(sysctl -n net.ipv4.tcp_congestion_control) && q=$(sysctl -n net.core.default_qdisc) || return 1
+ if ! sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+  command -v modprobe >/dev/null && modprobe tcp_bbr 2>/dev/null || :
+ fi
+ sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr || { err '内核未提供 BBR；容器可能需要宿主机支持'; return 1; }
+ confirm '启用 BBR + fq，并写入持久化 sysctl 配置?' || return 0
+ mkdir -p "${BBR_STATE%/*}" || return 1
+ printf '%s\n%s\n' "$old" "$q" > "$BBR_STATE" || return 1
+ tmp=$(mktemp /etc/sysctl.d/.sb-bbr.XXXXXX) || { rm -f "$BBR_STATE"; return 1; }
+ printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$tmp"
+ if sysctl -p "$tmp" && mv "$tmp" "$BBR_CONF"; then msg OK 'BBR 已启用'; bbr_status; else
+  sysctl -w "net.ipv4.tcp_congestion_control=$old" "net.core.default_qdisc=$q" || :
+  rm -f "$tmp"; err '启用失败，已尝试恢复；保留原设置记录'; return 1
+ fi
+}
+bbr_restore(){
+ local old q
+ [[ -s $BBR_STATE ]] || { err '没有本工具保存的原设置'; return 1; }
+ { read -r old; read -r q; } < "$BBR_STATE"
+ [[ $old =~ ^[A-Za-z0-9_]+$ && $q =~ ^[A-Za-z0-9_]+$ ]] || return 1
+ confirm '恢复启用前的 TCP 拥塞控制和默认队列?' || return 0
+ sysctl -w "net.ipv4.tcp_congestion_control=$old" "net.core.default_qdisc=$q" || return 1
+ rm -f "$BBR_CONF" "$BBR_STATE"; msg OK '已恢复原运行时设置'; bbr_status
+}
+bbr_menu(){
+ local n
+ while true; do ui_title 'BBR 管理'; bbr_status
+ columns '01 查看 BBR 状态|02 启用 BBR + fq' '03 恢复原设置|00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in 1|01) bbr_status;; 2|02) bbr_enable;; 3|03) bbr_restore;; 0|00) return;; *) err '无效选项';; esac
+ done
+}
 manager_status(){
  local st core final mode
  st=$(systemctl is-active sing-box 2>/dev/null || :)
@@ -534,7 +655,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 服务与节点管理|01 安装/更新核心|02 初始化服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 状态|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址'
+ columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '35 更新管理器|36 添加 Snell 入站' '00 退出管理工具'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -542,6 +663,6 @@ menu(){ local n; while true; do
  dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|add-snell) add_snell;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; dispatch "$@"; fi
