@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.17
+VERSION=2.2.18
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1080,7 +1080,8 @@ sing-box Manager v$VERSION
   public-address         自动检测或设置公网连接地址
   env                    系统环境检测
   argo                   固定 Argo 隧道管理
-  01-36                  对应主菜单编号
+  dns                    DNS 与 IPv6 管理
+  01-37                  对应主菜单编号
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
@@ -1242,6 +1243,120 @@ bbr_menu(){
  case $n in 1|01) bbr_status;; 2|02) bbr_enable;; 3|03) bbr_restore;; 0|00) return;; *) err '无效选项';; esac
  done
 }
+DNS_STATE=/var/lib/sb-manager/dns-original.json
+dns_show(){
+ [[ -s $C ]] || { err '请先初始化服务'; return 1; }
+ jq '{dns,default_domain_resolver:.route.default_domain_resolver,resolve_rules:[.route.rules[]?|select(.action=="resolve")],outbound_resolvers:[.outbounds[]?|select(has("domain_resolver"))|{tag,domain_resolver}]}' "$C"
+}
+dns_family_test(){
+ local family=$1 url ip
+ if [[ $family == 4 ]]; then url=https://api.ipify.org; else url=https://api6.ipify.org; fi
+ ip=$(curl -"$family" --noproxy '*' -fsS --connect-timeout 4 --max-time 8 "$url" 2>/dev/null) || return 1
+ printf '%s' "$ip" | python3 -c 'import ipaddress,sys
+try:
+ a=ipaddress.ip_address(sys.stdin.read().strip())
+ assert a.version==int(sys.argv[1]) and a.is_global and not a.is_multicast
+ print(a)
+except (ValueError,AssertionError): sys.exit(1)' "$family"
+}
+dns_network(){
+ local v4 v6
+ ip -6 addr show scope global; ip -6 route
+ v4=$(dns_family_test 4) || v4='不可达或检测接口失败'
+ v6=$(dns_family_test 6) || v6='不可达或检测接口失败'
+ printf 'IPv4 HTTPS：%s\nIPv6 HTTPS：%s\n' "$v4" "$v6"
+}
+# Save only DNS-related fields, never passwords or the entire configuration.
+# Resolve rules are keyed by their contents excluding strategy, not by array index.
+dns_snapshot(){
+ [[ -s $DNS_STATE ]] && return 0
+ install -d -m 700 /var/lib/sb-manager || return 1
+ local t; t=$(mktemp /var/lib/sb-manager/.dns-original.XXXXXX) || return 1
+ jq '{dns_present:has("dns"),dns:.dns,default_present:(.route|has("default_domain_resolver")),default_resolver:.route.default_domain_resolver,resolve:[.route.rules[]?|select(.action=="resolve")|{key:del(.strategy),present:has("strategy"),strategy}],outbounds:[.outbounds[]?|select(has("domain_resolver"))|{tag,domain_resolver}]}' "$C" > "$t" && chmod 600 "$t" && mv "$t" "$DNS_STATE" || { rm -f "$t"; return 1; }
+}
+dns_strategy(){
+ local strategy=$1
+ [[ -s $C ]] || { err '请先初始化服务'; return 1; }
+ case $strategy in ipv4_only|prefer_ipv4|ipv6_only|prefer_ipv6) ;; *) err '无效策略'; return 1;; esac
+ echo "将设置 DNS 默认策略及显式 resolve 动作为 $strategy；保留出站节点专用 resolver、DNS 规则及其他配置。"
+ echo '此设置不会禁用系统 IPv6，也不会拦截直接请求 IPv6 地址。'
+ confirm '备份并应用？sing-box 将短暂重启' || return 0
+ dns_snapshot || return 1
+ edit --arg s "$strategy" '.dns.strategy=$s | (.route.rules[]?|select(.action=="resolve")|.strategy)=$s | if (.route.default_domain_resolver|type)=="object" then .route.default_domain_resolver.strategy=$s else . end'
+}
+dns_auto(){
+ local v4='' v6='' strategy
+ echo '检测 VPS 直连 IPv4 / IPv6 HTTPS（不使用 shell 代理）...'
+ v4=$(dns_family_test 4) || :
+ v6=$(dns_family_test 6) || :
+ printf 'IPv4：%s\nIPv6：%s\n' "$v4" "$v6"
+ if [[ -n $v4 && -n $v6 ]]; then strategy=prefer_ipv4
+ elif [[ -n $v4 ]]; then strategy=ipv4_only
+ elif [[ -n $v6 ]]; then strategy=ipv6_only
+ else err '两个检测接口均不可达，无法可靠判断，不修改配置'; return 1; fi
+ printf '建议策略：%s（检测结果仅代表当前 HTTPS 可达性）\n' "$strategy"
+ dns_strategy "$strategy"
+}
+dns_server_set(){
+ local choice address
+ [[ -s $C ]] || { err '请先初始化服务'; return 1; }
+ echo '修改 local-dns 标签对应的服务器；保留其他 DNS 服务器及引用。'
+ choice=$(ask '服务器类型 local/udp/tcp' local) || return 1
+ case $choice in
+ local) address='';;
+ udp|tcp)
+  address=$(ask 'DNS IP 地址' '1.1.1.1') || return 1
+  address=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))' "$address" 2>/dev/null) || { err '请输入有效 IP'; return 1; };;
+ *) err '无效类型'; return 1;;
+ esac
+ jq -e '[.dns.servers[]?|select(.tag=="local-dns")]|length==1' "$C" >/dev/null || { err '未找到唯一 local-dns，拒绝修改自定义 DNS'; return 1; }
+ confirm '替换 local-dns 服务器并重启 sing-box?' || return 0
+ dns_snapshot || return 1
+ edit --arg t "$choice" --arg a "$address" '(.dns.servers[]|select(.tag=="local-dns")) = (if $t=="local" then {type:"local",tag:"local-dns"} else {type:$t,tag:"local-dns",server:$a} end)'
+}
+dns_lookup_test(){
+ local host
+ host=$(ask '测试域名' www.cloudflare.com) || return 1
+ [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { err '无效域名'; return 1; }
+ echo '系统解析器测试（不是 sing-box 内部 DNS）'
+ if command -v dig >/dev/null; then
+  dig +time=3 +tries=1 "$host" A; dig +time=3 +tries=1 "$host" AAAA
+ else
+  timeout 8 getent ahostsv4 "$host" || :
+  timeout 8 getent ahostsv6 "$host" || :
+ fi
+ echo 'sing-box 近期 DNS 错误：'
+ journalctl -u sing-box -n 300 --no-pager -o cat | grep -Ei 'dns:.*(failed|SERVFAIL)|router: lookup' | tail -20 || :
+}
+dns_restore(){
+ [[ -s $DNS_STATE && -s $C ]] || { err '无 DNS 原始快照'; return 1; }
+ echo '恢复首次 DNS 管理前的 DNS 段、默认 resolver 及仍匹配的 resolve 规则策略；不恢复整个配置。'
+ confirm '恢复原始 DNS 设置并重启 sing-box?' || return 0
+ edit --slurpfile b "$DNS_STATE" '
+ $b[0] as $o |
+ (if $o.dns_present then .dns=$o.dns else del(.dns) end) |
+ (if $o.default_present then .route.default_domain_resolver=$o.default_resolver else del(.route.default_domain_resolver) end) |
+ (.route.rules[]?|select(.action=="resolve")) |= (
+  . as $r | [$o.resolve[]|select(.key==($r|del(.strategy)))] as $m |
+  if ($m|length)==1 then if $m[0].present then .strategy=$m[0].strategy else del(.strategy) end else . end
+ )' || return 1
+ rm -f "$DNS_STATE"
+}
+dns_menu(){
+ local n
+ while true; do
+ ui_title 'DNS 与 IPv6 管理'
+ if [[ -s $C ]]; then jq -r '"默认 DNS 策略："+(.dns.strategy//"核心默认")' "$C"; fi
+ columns '01 查看当前 DNS 配置|02 检测 IPv4 / IPv6|03 自动选择解析策略|04 仅使用 IPv4|05 优先使用 IPv4' '06 仅使用 IPv6|07 优先使用 IPv6|08 设置 DNS 服务器|09 DNS 解析测试|10 恢复原始 DNS 配置'
+ echo '00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in
+  1|01) dns_show;; 2|02) dns_network;; 3|03) dns_auto;; 4|04) dns_strategy ipv4_only;; 5|05) dns_strategy prefer_ipv4;;
+  6|06) dns_strategy ipv6_only;; 7|07) dns_strategy prefer_ipv6;; 8|08) dns_server_set;; 9|09) dns_lookup_test;; 10) dns_restore;;
+  0|00) return;; *) err '无效选项';;
+ esac
+ done
+}
 manager_status(){
  local st core final mode
  printf '系统：%s | 架构：%s | 虚拟化：%s\n' "$(env_os)" "$(env_arch)" "$(virt)"
@@ -1305,7 +1420,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理'
+ columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -1327,6 +1442,6 @@ menu(){ local n; while true; do
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; 37|dns) dns_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
