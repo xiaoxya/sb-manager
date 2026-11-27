@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.10
+VERSION=2.2.11
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -22,7 +22,134 @@ confirm(){ local a; read -rp "$1 [y/N]: " a; [[ $a == y || $a == Y ]]; }
 need(){ local x; for x in "$@"; do command -v "$x" >/dev/null || { err "缺少 $x，请先安装依赖"; return 1; }; done; }
 port(){ [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
 virt(){ systemd-detect-virt 2>/dev/null || :; }
+# Architecture and host capability detection; no configuration changes.
+env_arch(){ case $(uname -m) in x86_64) echo amd64;; aarch64|arm64) echo arm64;; *) uname -m;; esac; }
+env_os(){ ( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-未知 Linux}" ); }
+env_preflight(){
+ local a os da
+ a=$(env_arch); os=$( . /etc/os-release 2>/dev/null; echo "${ID:-unknown}" )
+ [[ $a == amd64 || $a == arm64 ]] || { err "未验证的 CPU 架构: $a"; return 1; }
+ [[ $os == debian || $os == ubuntu ]] || { err "仅支持 Debian/Ubuntu: $os"; return 1; }
+ need apt-get dpkg systemctl || return 1
+ da=$(dpkg --print-architecture) || return 1
+ [[ $da == "$a" ]] || { err "内核与软件包架构不一致: $a / $da"; return 1; }
+ [[ -d /run/systemd/system ]] && systemctl show --property=Version --value >/dev/null 2>&1 || { err 'systemd 不可用'; return 1; }
+}
+env_report(){
+ local x a
+ a=$(env_arch)
+ ui_title '系统环境检测'
+ printf '操作系统：%s\nCPU 架构：%s (%s)\n内核：%s\n虚拟化：%s\n' "$(env_os)" "$a" "$(uname -m)" "$(uname -r)" "$(virt)"
+ printf '软件包架构：%s\n' "$(dpkg --print-architecture 2>/dev/null || echo unknown)"
+ if [[ -d /run/systemd/system ]] && systemctl show --property=Version --value >/dev/null 2>&1; then echo 'systemd：可用'; else echo 'systemd：不可用'; fi
+ free -h 2>/dev/null || :; df -h / /var/lib 2>/dev/null || :
+ for x in curl jq openssl python3 ip ss systemctl sing-box cloudflared; do
+  if command -v "$x" >/dev/null; then printf '%s: OK\n' "$x"; else printf '%s: 未安装\n' "$x"; fi
+ done
+ if command -v sing-box >/dev/null; then sing-box version; fi
+ bbr_status || :
+ printf 'Argo 服务：%s\n' "$(systemctl is-active sb-argo.service 2>/dev/null || :)"
+}
+ARGO_UNIT=/etc/systemd/system/sb-argo.service
+ARGO_DIR=/etc/sb-argo
+argo_status(){ systemctl status sb-argo.service --no-pager -l; }
+argo_install_core(){
+ env_preflight || return 1
+ command -v cloudflared >/dev/null && { cloudflared --version; return; }
+ confirm '添加 Cloudflare 官方 APT 仓库并安装 cloudflared?' || return 1
+ apt-get update && apt-get install -y ca-certificates curl || return 1
+ local k; k=$(mktemp) || return 1
+ if ! curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o "$k"; then rm -f "$k"; return 1; fi
+ install -m 644 "$k" /usr/share/keyrings/sb-cloudflare.gpg && rm -f "$k" || return 1
+ local list=/etc/apt/sources.list.d/sb-cloudflared.list
+ if [[ -e $list ]]; then
+  grep -Fxq 'deb [signed-by=/usr/share/keyrings/sb-cloudflare.gpg] https://pkg.cloudflare.com/cloudflared any main' "$list" || { err 'APT 配置已存在且不同'; return 1; }
+ else
+  printf '%s\n' 'deb [signed-by=/usr/share/keyrings/sb-cloudflare.gpg] https://pkg.cloudflare.com/cloudflared any main' > "$list" || return 1
+ fi
+ apt-get update && apt-get install -y cloudflared
+}
+argo_setup() (
+ local w p host path uuid token bin
+ [[ -s $C ]] || { err '请先安装 sing-box 服务'; exit 1; }
+ [[ ! -e $ARGO_UNIT && ! -e $ARGO_DIR ]] || { err '已存在 Argo 管理配置，拒绝覆盖'; exit 1; }
+ jq -e 'any(.inbounds[];.tag=="argo-vless-in")' "$C" >/dev/null && { err 'argo-vless-in 已存在'; exit 1; }
+ argo_install_core || exit 1
+ bin=$(command -v cloudflared) || exit 1
+ [[ $bin =~ ^/[A-Za-z0-9_./-]+$ ]] || exit 1
+ cloudflared tunnel run --help 2>&1 | grep -q -- '--token-file' || { err 'cloudflared 不支持 token-file，请升级'; exit 1; }
+ p=$(ask '本地 WS TCP 端口' 18080) || exit 1; port "$p" || exit 1; p=$((10#$p))
+ jq -e --argjson p "$p" 'any(.inbounds[];.listen_port==$p and .type!="hysteria2")' "$C" >/dev/null && { err '端口冲突'; exit 1; }
+ [[ -z $(ss -H -lnt "sport = :$p") ]] || { err '端口已被占用'; exit 1; }
+ host=$(ask 'Cloudflare 已配置的公网域名' '') || exit 1
+ [[ $host =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err '域名无效'; exit 1; }
+ path=$(ask 'WebSocket 路径' "/$(openssl rand -hex 12)") || exit 1
+ [[ $path =~ ^/[A-Za-z0-9_/-]+$ ]] || { err '路径无效'; exit 1; }
+ printf '请在 Cloudflare Tunnel 控制台设置公开应用：%s → HTTP http://127.0.0.1:%s\n' "$host" "$p"
+ read -rs -p '粘贴 Tunnel connector token（不回显）: ' token || exit 1; echo
+ [[ $token =~ ^[A-Za-z0-9_+/=-]+$ ]] || { err '令牌格式无效'; exit 1; }
+ uuid=$(sing-box generate uuid) || exit 1
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ jq --argjson p "$p" --arg path "$path" --arg u "$uuid" '.inbounds += [{type:"vless",tag:"argo-vless-in",listen:"127.0.0.1",listen_port:$p,users:[{name:"client",uuid:$u}],transport:{type:"ws",path:$path}}]' "$C" > "$w/new" || exit 1
+ confirm '添加独立 VLESS WS 入站并启动固定 Argo 隧道？sing-box 将重启' || exit 0
+ mkdir -m 700 "$ARGO_DIR" || exit 1
+ printf '%s' "$token" > "$ARGO_DIR/token"; unset token
+ chmod 600 "$ARGO_DIR/token" || exit 1
+ jq -n --arg host "$host" '{hostname:$host}' > "$ARGO_DIR/meta.json" || exit 1
+ cat > "$ARGO_UNIT" <<UNIT
+[Unit]
+Description=sb-manager Cloudflare Tunnel
+After=network-online.target sing-box.service
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=$bin tunnel --no-autoupdate run --token-file $ARGO_DIR/token
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+ if ! apply "$w/new"; then rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json"; rmdir "$ARGO_DIR"; exit 1; fi
+ if systemctl daemon-reload && systemctl enable --now sb-argo.service; then
+  msg OK '连接器已启动；公网可用性需测试'
+  argo_info
+ else err '连接器启动失败；入站已添加，请检查日志或使用删除功能'; exit 1; fi
+)
+argo_info(){
+ [[ -s $ARGO_DIR/meta.json ]] || { err '未配置 Argo'; return 1; }
+ python3 - "$C" "$ARGO_DIR/meta.json" <<'PYARGO'
+import json,sys
+from urllib.parse import urlencode
+c=json.load(open(sys.argv[1])); h=json.load(open(sys.argv[2]))["hostname"]
+for i in c["inbounds"]:
+ if i.get("tag")=="argo-vless-in":
+  for u in i["users"]:
+   q=urlencode(dict(encryption="none",security="tls",type="ws",sni=h,host=h,path=i["transport"]["path"]))
+   print("vless://"+u["uuid"]+"@"+h+":443?"+q+"#argo-vless")
+PYARGO
+}
+argo_remove(){
+ [[ -f $ARGO_UNIT ]] || { err '未安装本工具管理的 Argo'; return 1; }
+ if jq -e 'any(.inbounds[];.tag=="argo-vless-in")' "$C" >/dev/null; then
+  [[ $(jq '.inbounds|length' "$C") -gt 1 ]] || { err '至少保留一个入站'; return 1; }
+  if jq -e 'del(.inbounds[]|select(.tag=="argo-vless-in"))|any(..|strings;.=="argo-vless-in")' "$C" >/dev/null || { [[ -s $POLICY ]] && jq -e 'any(..|strings;.=="argo-vless-in")' "$POLICY" >/dev/null; }; then err 'Argo 入站仍被配置引用'; return 1; fi
+  confirm '删除本地 Argo 入站及连接器服务？不删除 Cloudflare 云端隧道' || return 0
+  edit '.inbounds |= map(select(.tag!="argo-vless-in"))' || return 1
+ else confirm '删除本地连接器服务?' || return 0; fi
+ systemctl disable --now sb-argo.service || return 1
+ rm -f "$ARGO_UNIT" "$ARGO_DIR/token" "$ARGO_DIR/meta.json"; rmdir "$ARGO_DIR" 2>/dev/null || :
+ systemctl daemon-reload
+}
+argo_menu(){
+ local n
+ while true; do ui_title 'Argo 固定隧道管理'
+ columns '01 安装连接器|02 配置固定隧道及 WS 入站|03 查看状态|04 查看分享链接' '05 启动连接器|06 停止连接器|07 实时日志|08 删除本地隧道|00 返回'
+ read -rp "$(ui_prompt '请选择操作：')" n || return
+ case $n in 1|01) argo_install_core;; 2|02) argo_setup;; 3|03) argo_status;; 4|04) argo_info;; 5|05) systemctl start sb-argo.service;; 6|06) systemctl stop sb-argo.service;; 7|07) journalctl -u sb-argo.service -n 30 -f;; 8|08) argo_remove;; 0|00) return;; *) err '无效选项';; esac
+ done
+}
 install_core(){
+ env_preflight || return 1
  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl jq openssl iproute2 netcat-openbsd python3 procps || return 1
  local f; f=$(mktemp); curl -fsSL https://sing-box.app/install.sh -o "$f" && bash "$f"; local rc=$?; rm -f "$f"; ((rc==0)) || return "$rc"
  sing-box version; systemctl enable sing-box
@@ -653,7 +780,9 @@ sing-box Manager v$VERSION
   backup | restore       备份 / 恢复配置 JSON
   disk | clean           磁盘检查 / 清理
   bbr                    BBR 管理
-  01-35                  对应主菜单编号
+  env                    系统环境检测
+  argo                   固定 Argo 隧道管理
+  01-36                  对应主菜单编号
   部分维护功能仅提供数字菜单入口。
 
 示例：
@@ -816,6 +945,8 @@ bbr_menu(){
 }
 manager_status(){
  local st core final mode
+ printf '系统：%s | 架构：%s | 虚拟化：%s\n' "$(env_os)" "$(env_arch)" "$(virt)"
+ printf 'Argo：%s\n' "$(systemctl is-active sb-argo.service 2>/dev/null || :)"
  st=$(systemctl is-active sing-box 2>/dev/null || :)
  core=$(sing-box version 2>/dev/null | head -n 1); core=${core#sing-box version }; core=${core:-未安装}
  printf '服务状态：'; case $st in active) paint '1;32' '● 运行中';; activating|deactivating) paint '1;33' "$st";; *) paint '1;31' "未运行 (${st:-unknown})";; esac
@@ -848,12 +979,12 @@ menu(){ local n; while true; do
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址'
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '35 更新管理器' '00 退出管理工具'
+ columns '35 更新管理器|36 Argo 隧道管理' '00 退出管理工具'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
  dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|argo) argo_menu;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; if [[ ${1:-} != install-manager && ${1:-} != self-update ]]; then policy_migrate || exit 1; fi; dispatch "$@"; fi
