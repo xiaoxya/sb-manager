@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.3.0
+VERSION=2.3.1
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -12,7 +12,35 @@ BASE=https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite
 # Color is presentation only; prompts must not contaminate captured values.
 ui_color(){ [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; }
 paint(){ local c=$1; shift; if ui_color; then printf '\033[%sm%s\033[0m' "$c" "$*"; else printf '%s' "$*"; fi; }
-ui_title(){ printf '\n'; paint '1;36' "==== $* ===="; printf '\n'; }
+ui_width(){
+ local w
+ w=$(tput cols 2>/dev/null || echo 80)
+ [[ $w =~ ^[0-9]{1,5}$ ]] && ((w>0)) || w=80
+ ((w<=100)) || w=100
+ printf '%s\n' "$w"
+}
+ui_separator(){
+ local line w
+ w=$(ui_width)
+ printf -v line '%*s' "$w" ''
+ paint '36' "${line// /-}"
+ printf '\n'
+}
+ui_title(){
+ local w indent=6 title="$*" length
+ w=$(ui_width)
+ [[ $title != sing-box\ Manager* ]] || indent=8
+ if command -v python3 >/dev/null; then
+  length=$(python3 -c 'import sys,unicodedata as u;print(sum(0 if u.combining(c) else 2 if u.east_asian_width(c) in "WF" else 1 for c in sys.argv[1]))' "==== $title ====")
+ else length=${#title}; length=$((length*2+10)); fi
+ [[ $length =~ ^[0-9]+$ ]] || length=$w
+ ((indent+length<=w)) || indent=$((w-length))
+ ((indent>=0)) || indent=0
+ printf '\n%*s' "$indent" ''
+ paint '1;36' "==== $title ===="
+ printf '\n'
+ ui_separator
+}
 ui_prompt(){ if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then printf '\033[1;36m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
 msg(){ printf '\n[%s] %s\n' "$1" "$2"; }
 err(){ msg ERROR "$*" >&2; return 1; }
@@ -882,7 +910,7 @@ legacy_dispatch(){ case ${1:-} in
 1|update) install_core;; 2|02|init) init_menu;; init-entry|init-hk) init_role entry;; init-landing|init-tw) init_role landing;; 28|rules) route_manage;; 3|start) systemctl start sing-box;; 4|stop) systemctl stop sing-box;; 5|restart) systemctl restart sing-box;; 6|status) systemctl status sing-box --no-pager -l;; 7|logs) journalctl -u sing-box -n 30 -f -o cat;; 8|info) info;; 9|port) change_port;; 10|change-relay) change_relay;; 11|fix-rules) fix_rules;; 12|relay) relay "${2:-}";; 13) local l; l=$(ask '日志级别' info); edit --arg l "$l" '.log.level=$l';; 14|test) reality_test;; 15) local k; k=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") && public_key "$k";; 16) tls_target;; 17) ntp;; 18|diagnose) diagnose;; 19) foreground;; 20|fix-perm) permissions;; 21|backup) backup;; 22|restore) restore;; 23|disk) disk;; 24|clean) clean;; 25) limit_logs;; 26) sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control net.core.default_qdisc;; 27) local a; a=$(ask 'enable/disable' enable); case $a in enable|disable) systemctl "$a" sing-box;; esac;; 29|test-route) route_test;; 30|monitor) monitor;; 31) local period; period=$(ask '统计时间（1 hour/24 hours）' '1 hour'); journalctl -u sing-box --since "$period ago" -o cat --no-pager | sed -n 's/.*inbound connection to //p' | sort | uniq -c | sort -nr | head -50;; 32) local p; p=$(jq -r '.inbounds[]|select(.tag=="anytls-in")|.listen_port' "$C"); watch -n 1 "ss -tinp 'sport = :$p'";; 33) command -v nload >/dev/null || apt-get install -y nload; nload;; 34|public-address) set_public_address;; install-manager) if [[ $(readlink -f "$0") == /usr/local/bin/sb ]]; then return 0; fi; if [[ -e /usr/local/bin/sb ]]; then confirm "备份并替换旧 sb?" || return 0; cp -a /usr/local/bin/sb "/usr/local/bin/sb.bak.$(date +%s)" || return 1; fi; install -m 755 "$0" /usr/local/bin/sb;; '') menu;; *) err '未知命令';; esac; }
 # v2.2: use screen-cell width rather than byte width for Chinese menus.
 columns(){
- local width color=0; width=$(tput cols 2>/dev/null || echo 80); [[ $width =~ ^[0-9]+$ ]] || width=80; ui_color && color=1
+ local width color=0; width=$(ui_width); ui_color && color=1
  if ! command -v python3 >/dev/null; then printf '%s\n' "$1" "$2" | tr '|' '\n'; return; fi
  python3 -c 'import sys,unicodedata as u,re
 w=int(sys.argv[1]); a,b=sys.argv[2].split("|"),sys.argv[3].split("|"); color=sys.argv[4]=="1"
@@ -905,14 +933,29 @@ def fmt(s):
  elif any(x in label for x in ("初始化","恢复","重启","清理","删除","更新核心")): c="1;33"
  elif any(x in label for x in ("分流","中转","出站")): c="1;34"
  return p(n,"1;32")+sp+(p(label,c) if c else label)
-n=max(36,max(map(cells,a))+4)
-if w>=110: n=max(n,w//2)
-if w<90 or n+max(map(cells,b))>w:
+def wrap(s,limit):
+ if not s: return [""]
+ result=[]; part=""; used=0
+ for ch in s:
+  size=cells(ch)
+  if used+size>limit and part:
+   result.append(part); part=""; used=0
+  part+=ch; used+=size
+ if part: result.append(part)
+ return result
+# Stable starting position across status, main menu and all submenus.
+n=(w+2)//2
+if w<80 or not any(b):
  for x in a+b:
-  if x: print(fmt(x))
+  if x:
+   for part in wrap(x,max(1,w)): print(fmt(part))
 else:
  for i in range(max(len(a),len(b))):
-  l=a[i] if i<len(a) else ""; r=b[i] if i<len(b) else ""; print(fmt(l)+(" "*max(0,n-cells(l))+fmt(r) if r else ""))' "$width" "$1" "$2" "$color"
+  l=wrap(a[i] if i<len(a) else "",n-3)
+  r=wrap(b[i] if i<len(b) else "",w-n)
+  for j in range(max(len(l),len(r))):
+   x=l[j] if j<len(l) else ""; y=r[j] if j<len(r) else ""
+   print(fmt(x)+(" "*max(0,n-cells(x))+fmt(y) if y else ""))' "$width" "$1" "$2" "$color"
 }
 init_menu(){ local n; ui_title '初始化 sing-box 服务'; columns '01 独立代理（单 VPS）|02 入口中转|03 落地服务|00 返回' ''; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) init_role standalone;; 2|02) init_role entry;; 3|03) init_role landing;; 0|00) return;; *) err '无效选项';; esac; }
 proxy_list(){ jq -r '.outbounds[]|[.tag,.type,(.server // "-"),(.server_port // "-")]|@tsv' "$C"; }
@@ -1459,7 +1502,8 @@ service_menu(){
  local n
  while true; do
   ui_title '安装服务 / 入站管理'
-  columns '01 独立代理（初始化）|02 入口中转（初始化）|03 落地服务（初始化）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|07 修改监听端口|08 查看节点信息|09 设置公网地址|00 返回'
+  columns '01 独立代理（初始化）|02 入口中转（初始化）|03 落地服务（初始化）|04 查看现有入站|05 添加协议入站' '06 删除指定入站|07 修改监听端口|08 查看节点信息|09 设置公网地址|00 返回'
+  ui_separator
   read -rp "$(ui_prompt '请选择操作：')" n || return
   case $n in
    1|01|2|02|3|03)
@@ -2370,9 +2414,9 @@ self_update_cli(){
 menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
- paint '36' '--------------------------------------------------------'; printf '\n'
+ ui_separator
  columns '◆ 服务与节点管理|01 核心管理|02 入站节点管理|03 出站节点管理|04 智能分流管理|05 启动服务|06 停止服务|07 重启服务|08 服务状态|09 REALITY 管理|10 TLS 证书管理' '◆ 系统与网络管理|11 Argo 隧道管理|12 DNS 与 IPv6 管理|13 网络性能优化|14 流量与连接监控|15 安全防护管理|16 日志管理|17 系统维护|18 备份与恢复|19 磁盘管理|20 更新管理器'
- paint '36' '--------------------------------------------------------'; printf '\n'
+ ui_separator
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
