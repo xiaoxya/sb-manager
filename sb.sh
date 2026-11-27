@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.31
+VERSION=2.3.0
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -1343,7 +1343,7 @@ sing-box Manager v$VERSION
   dns                    DNS 与 IPv6 管理（含系统级 IPv6 启停）
   cert                   TLS 证书管理
   security               REALITY 安全防护管理
-  01-39                  对应主菜单编号
+  01-39                  保留 v2.2 旧数字 CLI 映射（与新版交互菜单不同）
   99                     彻底卸载服务
   部分维护功能仅提供数字菜单入口。
 
@@ -1354,7 +1354,7 @@ sing-box Manager v$VERSION
   sb self-update
 HELP
 }
-proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|09 导出出站节点|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 9|09) proxy_export;; 0|00) return;; esac; done; }
+proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|09 导出出站节点|10 中转测试|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 9|09) proxy_export;; 10) relay;; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
 POLICY=/var/lib/sb-manager/sb-policy.json
 policy_migrate(){
@@ -1383,7 +1383,7 @@ route_export(){ local f; policy_ready || return 1; f=$(ask '导出文件路径' 
 route_import(){ local f; policy_normal || return 1; f=$(ask '导入文件路径' '') || return 1; jq -e '.route.rules|type=="array"' "$f" >/dev/null || return 1; # only active rules imported; metadata is intentionally not imported
  confirm '替换当前活动分流规则及规则集？保留本机 DNS/出站，不导入禁用规则' || return 0; edit --slurpfile p "$f" '.route.rules=$p[0].route.rules|.route.rule_set=$p[0].route.rule_set|.route.final=$p[0].route.final'; }
 add_preset(){ local n name tag target url w; policy_normal || return 1; ui_title '预设规则集管理'; columns '01 AI 全部|02 OpenAI|03 Claude|04 Gemini|05 Crypto 全部|06 Binance|07 OKX|08 Web3|09 TikTok|10 Netflix|11 YouTube|12 Disney+|13 Spotify|14 Twitch' '15 Telegram|16 Twitter/X|17 Discord|18 GitHub|19 Google|20 Microsoft|21 Apple|22 Cloudflare|23 国外游戏|24 Speedtest|25 广告拦截|26 中国大陆域名|27 中国大陆IP'; echo '支持逗号多选；每个规则集先下载检测'; n=$(ask '编号' '') || return 1; target=$(route_target) || return 1; local -a names=(none 'category-ai-!cn' openai anthropic google-gemini category-cryptocurrency binance okx web3 tiktok netflix youtube disney spotify twitch telegram twitter discord github google microsoft apple cloudflare category-games-!cn speedtest category-ads-all cn cn); local -a picks; IFS=, read -ra picks <<< "$n"; for n in "${picks[@]}"; do [[ $n =~ ^[0-9]{1,2}$ ]] || return 1; n=$((10#$n)); ((n>=1 && n<=27)) || return 1; name=${names[n]}; tag="preset-$name"; url="$BASE/$name.srs"; if ((n==27)); then tag=preset-geoip-cn; url="${BASE%/geosite}/geoip/cn.srs"; fi; if ! curl -fsSL --max-time 25 -o /dev/null "$url"; then err "上游规则集不可用: $name，跳过"; continue; fi; confirm "添加 $tag → $target?" || continue; edit --arg tag "$tag" --arg url "$url" --arg t "$target" '.http_clients=((.http_clients // [])|if any(.[];.tag=="rule-download") then . else .+[{tag:"rule-download"}] end)|.route.default_http_client=(.route.default_http_client // "rule-download")|.route.rule_set=((.route.rule_set // [])|if any(.[];.tag==$tag) then . else .+[{type:"remote",tag:$tag,format:"binary",url:$url,update_interval:"24h"}] end)|.route.rules |= (([to_entries[]|select(.value.action=="resolve")|.key][0] // length) as $i | .[:$i]+[({rule_set:[$tag]}+(if $t=="reject" then {action:"reject"} else {action:"route",outbound:$t} end))]+.[$i:])' || return 1; done; }
-route_manage(){ local n; [[ -s $C ]] || return 1; policy_ready || return 1; while true; do ui_title '分流规则管理'; jq -r '"默认出站: \(.route.final) | 活动规则: \(.route.rules|length)"' "$C"; columns '01 查看规则|02 添加/修改/删除/排序规则|05 启用/禁用规则|07 添加预设规则集|08 自定义规则集管理' '13 设置默认出站|14 切换分流模式|15 测试域名/IP|16 实时日志|17 导入配置|18 导出配置|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) route_list; jq '.disabled' "$POLICY";; 2|02|8|08) policy_normal && legacy_route_manage;; 5|05) rule_toggle;; 7|07) add_preset;; 13) policy_normal && set_final;; 14) mode_switch;; 15) route_test;; 16) monitor;; 17) route_import;; 18) route_export;; 0|00) return;; esac; done; }
+route_manage(){ local n; [[ -s $C ]] || return 1; policy_ready || return 1; while true; do ui_title '分流规则管理'; jq -r '"默认出站: \(.route.final) | 活动规则: \(.route.rules|length)"' "$C"; columns '01 查看规则|02 添加/修改/删除/排序规则|05 启用/禁用规则|07 添加预设规则集|08 自定义规则集管理' '13 设置默认出站|14 切换分流模式|15 测试域名/IP|16 实时日志|17 导入配置|18 导出配置|19 修复规则下载|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) route_list; jq '.disabled' "$POLICY";; 2|02|8|08) policy_normal && legacy_route_manage;; 5|05) rule_toggle;; 7|07) add_preset;; 13) policy_normal && set_final;; 14) mode_switch;; 15) route_test;; 16) monitor;; 17) route_import;; 18) route_export;; 19) fix_rules;; 0|00) return;; esac; done; }
 # Append/remove only the selected inbound; never regenerate other credentials.
 inbound_list(){ jq -r '.inbounds[]|[.tag,.type,(.listen_port // "-")]|@tsv' "$C"; }
 inbound_add() (
@@ -1451,7 +1451,7 @@ service_menu(){
  local n
  while true; do
   ui_title '安装服务 / 入站管理'
-  columns '01 独立代理（初始化）|02 入口中转（初始化）|03 落地服务（初始化）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|00 返回'
+  columns '01 独立代理（初始化）|02 入口中转（初始化）|03 落地服务（初始化）' '04 查看现有入站|05 添加协议入站|06 删除指定入站|07 修改监听端口|08 查看节点信息|09 设置公网地址|00 返回'
   read -rp "$(ui_prompt '请选择操作：')" n || return
   case $n in
    1|01|2|02|3|03)
@@ -1459,6 +1459,9 @@ service_menu(){
    4|04) [[ -s $C ]] && inbound_list;;
    5|05) inbound_add;;
    6|06) inbound_delete;;
+   7|07) change_port;;
+   8|08) info;;
+   9|09) set_public_address;;
    0|00) return;;
    *) err '无效选项';;
   esac
@@ -2214,23 +2217,106 @@ security_menu(){
  done
 }
 manager_status(){
- local st core final mode
- printf '系统：%s | 架构：%s | 虚拟化：%s\n' "$(env_os)" "$(env_arch)" "$(virt)"
- printf 'Argo：%s\n' "$(systemctl is-active sb-argo.service 2>/dev/null || :)"
- st=$(systemctl is-active sing-box 2>/dev/null || :)
- core=$(sing-box version 2>/dev/null | head -n 1); core=${core#sing-box version }; core=${core:-未安装}
- printf '服务状态：'; case $st in active) paint '1;32' '● 运行中';; activating|deactivating) paint '1;33' "$st";; *) paint '1;31' "未运行 (${st:-unknown})";; esac
- printf '    核心版本：%s\n' "$core"
- if [[ -s $C ]] && command -v jq >/dev/null; then
-  jq -r '"入站节点：\(.inbounds|length)    出站节点：\(.outbounds|length)    活动规则：\(.route.rules // [] | length)"' "$C" 2>/dev/null || :
-  final=$(jq -r '.route.final // "(未设置)"' "$C" 2>/dev/null)
-  mode='智能分流/自定义'
-  if [[ -s $POLICY ]] && jq -e '.saved != null' "$POLICY" >/dev/null 2>&1; then
-   if [[ $final == direct ]]; then mode='全局直连'; else mode='全局中转'; fi
-  elif jq -e 'all(.outbounds[]; .type=="direct")' "$C" >/dev/null 2>&1; then mode='仅本机出口'; fi
-  printf '默认出口：'; paint '1;32' "$final"; printf '    分流模式：'; paint '1;34' "$mode"; printf '\n'
- else printf '配置状态：未初始化或缺少 jq\n'; fi
+ local st core final='未知' mode='未初始化' count='未知' dns='未知' strategy='默认' ip6='未知' block='未知' cc q host os mem disk boot addr='未设置' argo='未配置' proto='—' edge='—' live='—' met args ready cert='未配置' expiry now days timer='关' sec='未配置' banned='—' raw ports saved path
+ host=$(hostname 2>/dev/null || echo unknown)
+ os=$( . /etc/os-release 2>/dev/null; printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}" )
+ mem=$(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0 && a>=0)printf "%.0f%%",100*(t-a)/t;else print "未知"}' /proc/meminfo 2>/dev/null)
+ disk=$(df -P / 2>/dev/null | awk 'NR==2{print $5}')
+ st=$(systemctl is-active sing-box.service 2>/dev/null || :)
+ case $st in active) st='运行中';; failed) st='故障';; activating|deactivating) st='切换中';; *) st='未运行';; esac
+ core=$(sing-box version 2>/dev/null | head -n1); core=${core#sing-box version }; core=${core:-未安装}
+ boot='关'; systemctl is-enabled --quiet sing-box.service 2>/dev/null && boot='开'
+ [[ ! -s $META ]] || IFS= read -r addr < "$META" || :
+ if [[ -s $C ]] && command -v jq >/dev/null && jq -e 'type=="object"' "$C" >/dev/null 2>&1; then
+  count=$(jq -r '"入站：\(.inbounds//[]|length) / 出站：\(.outbounds//[]|length)"' "$C")
+  final=$(jq -r '.route.final//"未设置"' "$C")
+  mode='自定义'
+  if jq -e '(.route.rules//[])|all(.action!="route" and .action!="route-options")' "$C" >/dev/null; then
+   if [[ $final == direct ]]; then mode='全局直连'; elif [[ $final != 未设置 ]]; then mode='全局中转'; fi
+  elif jq -e 'any(.route.rules[]?; ((.rule_set//[])|index("geosite-ai"))!=null or ((.domain_suffix//[])|index("chatgpt.com"))!=null)' "$C" >/dev/null 2>&1; then mode='智能分流/自定义'; fi
+  dns=$(jq -r '(.dns.final//"默认") as $t|([.dns.servers[]?|select(.tag==$t)][0]//.dns.servers[0]//{})|[.type//"未知",.tag//""]|join(" ")' "$C")
+  strategy=$(jq -r '.dns.strategy//"默认"' "$C")
+  block='关'; jq -e 'any(.route.rules[]?;.ip_version==6 and .action=="reject")' "$C" >/dev/null && block='开'
+  path=$(jq -r '[.inbounds[]?|.tls.certificate_path//empty][0]//empty' "$C")
+  if [[ -n $path ]]; then
+   cert='无法读取'
+   expiry=$(openssl x509 -in "$path" -noout -enddate 2>/dev/null); expiry=$(date -d "${expiry#notAfter=}" +%s 2>/dev/null) || expiry=''
+   if [[ $expiry =~ ^[0-9]+$ ]]; then now=$(date +%s); days=$(((expiry-now)/86400)); if ((expiry<=now)); then cert='已过期'; else cert="剩余${days}天"; fi; fi
+  fi
+ fi
+ case $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) in 1) ip6='禁用';; 0) ip6='启用';; esac
+ cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)
+ q=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)
+ if systemctl is-active --quiet sb-argo.service 2>/dev/null; then
+  argo='运行/健康未知'
+  args=$(systemctl show sb-argo.service -p ExecStart --value 2>/dev/null)
+  proto=$(sed -nE 's/.*--protocol[ =]+(auto|quic|http2)([ ;]|$).*/\1/p' <<< "$args"); proto=${proto:-auto}
+  edge=$(sed -nE 's/.*--edge-ip-version[ =]+(auto|4|6)([ ;]|$).*/\1/p' <<< "$args"); edge=${edge:-默认}
+  if met=$(timeout 1 bash -c 'pid=$(systemctl show sb-argo.service -p MainPID --value); [[ $pid =~ ^[1-9][0-9]*$ ]] || exit 1; journalctl -u sb-argo.service "_PID=$pid" -b --no-pager -o cat | sed -nE "s/.*Starting metrics server on (127\.0\.0\.1:[0-9]+)\/metrics.*/\1/p" | tail -1' 2>/dev/null) && [[ $met =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
+   ready=$(curl --noproxy '*' -s --max-time 1 -o /dev/null -w '%{http_code}' "http://$met/ready" 2>/dev/null) || ready=''
+   case $ready in 200) argo='健康';; 503) argo='不健康';; esac
+   raw=$(curl --noproxy '*' -fsS --max-time 1 "http://$met/metrics" 2>/dev/null | awk '$1=="cloudflared_tunnel_ha_connections"{print $2;exit}')
+   [[ $raw =~ ^[0-9]+$ ]] && live=$raw
+  fi
+ elif [[ -e $ARGO_UNIT ]]; then argo='未运行'; fi
+ systemctl is-enabled --quiet sb-cert-renew.timer 2>/dev/null && timer='开'
+ if command -v fail2ban-client >/dev/null; then
+  if raw=$(timeout 1 fail2ban-client status "$SEC_JAIL" 2>/dev/null); then
+   sec='运行中'; banned=$(awk '/Currently banned:/{print $NF}' <<< "$raw"); banned=${banned:-未知}
+  elif [[ -s $SEC_STATE ]]; then sec='未运行/未知'; fi
+ fi
+ columns "◆ 系统环境|主机：$host / $os|架构：$(env_arch) / $(virt)|内存：${mem:-未知} / 磁盘：${disk:-未知}" "◆ 代理服务|$st / $core / 自启：$boot|$count / $final|分流：$mode"
+ columns "◆ 网络状态|连接地址：$addr|DNS：$dns / $strategy|$cc + $q / IPv6：$ip6 / 拦截：$block" "◆ 扩展服务|Argo：$argo / $proto / IP:$edge / $live 条|证书：$cert / 续期：$timer|防护：$sec / 封禁：$banned"
+ if [[ -s $SEC_STATE ]] && command -v jq >/dev/null; then
+  ports=$(sec_ports 2>/dev/null || :); saved=$(jq -r '.ports//empty' "$SEC_STATE" 2>/dev/null)
+  if [[ -n $saved && $ports != "$saved" ]]; then paint '1;33' '[WARN] REALITY 防护端口与配置不一致，请重新应用防护'; printf '\n'; fi
+ fi
+ if [[ $cert == 已过期 ]]; then paint '1;31' '[WARN] TLS 证书已过期'; printf '\n'; fi
 }
+group_menu(){
+ local title=$1 left=$2 right=$3 n action i
+ shift 3
+ local -a actions=("$@")
+ while true; do
+  ui_title "$title"; columns "$left" "$right"; echo '00 返回'
+  read -rp "$(ui_prompt '请选择操作：')" n || return
+  [[ $n == 0 || $n == 00 ]] && return 0
+  if [[ $n =~ ^[0-9]{1,2}$ ]]; then
+   i=$((10#$n-1))
+   if ((i>=0 && i<${#actions[@]})); then
+    action=${actions[i]}
+    dispatch "$action"
+    continue
+   fi
+  fi
+  err '无效选项'
+ done
+}
+main_choice(){
+ case $1 in
+  01|1) group_menu '核心管理' '01 查看核心版本' '02 安装/更新核心' core-version update;;
+  02|2) service_menu;;
+  03|3) proxy_menu;;
+  04|4) route_manage;;
+  05|5) dispatch start;;
+  06|6) confirm '停止 sing-box 服务？' && dispatch stop;;
+  07|7) confirm '重启 sing-box 服务？' && dispatch restart;;
+  08|8) dispatch status;;
+  09|9) group_menu 'REALITY 管理' '01 REALITY 连接测试|02 查看 REALITY 公钥' '03 TLS 目标管理|04 异常 IP 统计' test 15 16 security-stats;;
+  10) acme_menu;;
+  11) argo_menu;;
+  12) dns_menu;;
+  13) group_menu '网络性能优化' '01 网络环境检测|02 BBR 管理' '03 网卡实时速率' env bbr 33;;
+  14) group_menu '流量与连接监控' '01 实时流量监控|02 域名访问统计' '03 AnyTLS 连接监控|04 网卡实时速率' 30 31 32 33;;
+  15) security_menu;;
+  16) group_menu '日志管理' '01 实时日志|02 日志级别' '03 限制日志容量' logs 13 25;;
+  17) group_menu '系统维护' '01 时间同步|02 系统诊断|03 前台调试' '04 修复权限|05 开机启动' 17 diagnose 19 fix-perm 27;;
+  18) group_menu '备份与恢复' '01 创建备份' '02 恢复配置 JSON' backup restore;;
+  19) group_menu '磁盘管理' '01 磁盘检查' '02 安全清理' disk clean;;
+  *) err '无效主菜单编号';;
+ esac
+}
+
 # Return 10 only when new bytes have actually been installed.
 # Return 0 for unchanged/cancelled, 1 for errors. The parent menu reloads on 10.
 self_update() (
@@ -2277,7 +2363,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 功能菜单（左）|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|28 分流规则管理|29 智能分流测试|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|17 时间同步|18 系统诊断|19 前台调试' '◆ 功能菜单（右）|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|27 开机启动|30 实时流量监控|11 修复规则下载|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|35 更新管理器|36 Argo 隧道管理|37 DNS 与 IPv6 管理|38 TLS 证书管理|39 安全防护管理'
+ columns '◆ 服务与节点管理|01 核心管理|02 入站节点管理|03 出站节点管理|04 智能分流管理|05 启动服务|06 停止服务|07 重启服务|08 服务状态|09 REALITY 管理|10 TLS 证书管理' '◆ 系统与网络管理|11 Argo 隧道管理|12 DNS 与 IPv6 管理|13 网络性能优化|14 流量与连接监控|15 安全防护管理|16 日志管理|17 系统维护|18 备份与恢复|19 磁盘管理|20 更新管理器'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -2287,7 +2373,7 @@ menu(){ local n; while true; do
   read -rp "$(ui_prompt '回车继续...')" _ || return
   continue
  fi
- if [[ $n == 35 || $n == self-update ]]; then
+ if [[ $n == 20 || $n == self-update ]]; then
   local rc=0
   self_update || rc=$?
   if ((rc==10)); then
@@ -2295,11 +2381,11 @@ menu(){ local n; while true; do
    err '新版菜单启动失败，请检查安装文件'
    return 1
   fi
- elif [[ $n == 38 || $n == cert ]]; then acme_menu
+ elif [[ $n =~ ^[0-9]+$ ]]; then main_choice "$n"
  else dispatch "$n"; fi
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; 39|security) security_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; 39|security) security_menu;; security-stats) sec_stats;; core-version) sing-box version;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
