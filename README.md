@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.0** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.1** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -14,7 +14,8 @@
 - 智能分流、全局直连、全局中转模式及分流配置导入导出。
 - 独立临时客户端测试中转和路由，避免占用正式缓存数据库。
 - 配置备份、JSON 校验、启动失败回滚、权限修复、日志监控。
-- 中文自适应双列菜单，窄终端自动使用单列。
+- ANSI 彩色中文自适应双列菜单，窄终端自动使用单列，支持 NO_COLOR。
+- 中文服务状态、核心版本和分流状态栏；第 35 项或 `sb self-update` 更新管理器。
 
 ## 安装
 
@@ -125,6 +126,7 @@ sb test-route
 15 REALITY 公钥          32 AnyTLS 连接
 16 TLS 目标              33 网卡速率
 27 开机启动              34 公网地址
+35 更新管理器
 00 退出
 ```
 
@@ -214,6 +216,7 @@ sb test-outbound relay-jp 203.0.113.10
 | 命令 | 功能 |
 | --- | --- |
 | sb update | 安装 / 更新核心 |
+| sb self-update | 从 GitHub 更新管理器（不更新核心或重启服务） |
 | sb init | 初始化菜单 |
 | sb init-standalone | 单机初始化 |
 | sb init-entry | 入口初始化 |
@@ -302,3 +305,9 @@ journalctl -u sing-box -n 50 --no-pager
 - [sing-box 官方文档](https://sing-box.sagernet.org/)
 - [MetaCubeX 规则集](https://github.com/MetaCubeX/meta-rules-dat)
 - [问题反馈](https://github.com/xiaoxya/sb-manager/issues)
+
+## v2.2.1 界面与管理器更新
+
+已有 v2.2.0 用户先按上方安装命令更新管理器；之后可执行 `sb self-update` 或选择主菜单 35。下载后执行 Bash 语法检查并提示备份替换。更新完成后退出旧菜单，再运行 `sb`。管理器更新不会主动修改代理配置或重启服务。
+
+终端颜色默认自动检测，执行 `NO_COLOR=1 sb` 可使用纯文本菜单。终端宽度不足 90 列时自动使用单列。分流模式状态基于当前配置及保存的策略推断，不是实际流量测量。
