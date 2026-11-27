@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.22** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.23** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -395,3 +395,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.22 Argo 稳定性诊断
 
 主菜单 36 → 15 或 `sb argo-stability`：新增隧道日志事件统计（非实际断线次数）、近期 GoogleVideo CDN 直连 HTTPS 测试（非真实视频下载）、TCP 网络质量增量采样（非 QUIC 丢包率）、重复公网 VLESS 短请求测试（非持续长连接）、双服务实时日志，以及现有 QUIC/HTTP2 切换入口。诊断默认不改变正式配置或系统网络参数；协议切换需要确认并重启 Argo。尚未实机验证新菜单及诊断命令。
+
+## v2.2.23 YouTube CDN 诊断修复
+
+菜单 36 → 15 → 02：只从实际 inbound/outbound connection to 日志提取最近五个不同的 GoogleVideo 原始目标，排除 DNS CNAME 记录；支持自定义日志范围（1–1440 分钟）与每域名采样次数（1–3）。保留 TLS 验证，分类 curl 错误，HTTP 403/404 视为收到有效 HTTPS 响应而非视频下载成功。显示 DNS、TCP/TLS 阶段耗时、首字节及总耗时，汇总成功样本；按连接 ID 关联视频错误并区分其他 IPv6 历史错误。检测使用 VPS 系统 DNS 和 IPv4 直连，不经过 Argo；持续视频传输与端到端带宽尚未验证。更新不修改服务配置或重启服务。尚未进行 VPS 实机测试。
