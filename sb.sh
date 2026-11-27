@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.27
+VERSION=2.2.28
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -2057,11 +2057,12 @@ manager_status(){
 # Return 10 only when new bytes have actually been installed.
 # Return 0 for unchanged/cancelled, 1 for errors. The parent menu reloads on 10.
 self_update() (
- local w v stage='' backup_file target=/usr/local/bin/sb
+ w=''; stage=''
+ local v backup_file target=/usr/local/bin/sb
  w=$(mktemp -d) || exit 1
- trap 'rm -rf "$w"; [[ -z $stage ]] || rm -f "$stage"' EXIT
+ trap '[[ -z ${w:-} ]] || rm -rf -- "$w"; [[ -z ${stage:-} ]] || rm -f -- "$stage"' EXIT
  need curl bash cmp install mktemp mv || exit 1
- curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/xiaoxya/sb-manager/main/sb.sh -o "$w/sb.sh" || { err '下载失败，保留当前版本'; exit 1; }
+ curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 60 "https://raw.githubusercontent.com/xiaoxya/sb-manager/main/sb.sh?ts=$(date +%s)" -o "$w/sb.sh" || { err '下载失败，保留当前版本'; exit 1; }
  bash -n "$w/sb.sh" || { err '下载脚本语法检查失败，保留当前版本'; exit 1; }
  v=$(sed -n 's/^VERSION=\([0-9][0-9.]*\)$/\1/p' "$w/sb.sh")
  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err '下载文件版本标识无效'; exit 1; }
@@ -2099,7 +2100,7 @@ menu(){ local n; while true; do
  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then tput clear 2>/dev/null || :; fi
  ui_title "sing-box Manager v$VERSION"; manager_status
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '◆ 服务与节点管理|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动|35 更新管理器|38 TLS 证书管理' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|36 Argo 隧道管理|37 DNS 与 IPv6 管理'
+ columns '◆ 功能菜单 01–19|01 安装/更新核心|02 安装服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|17 时间同步|18 系统诊断|19 前台调试' '◆ 功能菜单 20–38|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 管理|27 开机启动|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址|35 更新管理器|36 Argo 隧道管理|37 DNS 与 IPv6 管理|38 TLS 证书管理'
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '00 退出管理工具' '99 彻底卸载服务'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
@@ -2117,10 +2118,11 @@ menu(){ local n; while true; do
    err '新版菜单启动失败，请检查安装文件'
    return 1
   fi
+ elif [[ $n == 38 || $n == cert ]]; then acme_menu
  else dispatch "$n"; fi
  read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert) acme_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update_cli;; 99|uninstall-service|uninstall-manager) uninstall_manager_cli;; 36|argo) argo_menu;; argo-stability) argo_stability_menu;; 37|dns) dns_menu;; 38|cert|certificate) acme_menu;; cert-renew) acme_renew;; env) env_report;; 18|diagnose) env_report; diagnose;; add-snell) inbound_add snell;; 2|init|install-service|inbounds) service_menu;; add-inbound) inbound_add "${2:-anytls}";; delete-inbound) inbound_delete;; 26|bbr) bbr_menu;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; export-outbound|export-node) proxy_export;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then case ${1:-} in -h|--help|help) show_help; exit 0;; -v|--version|version) printf "sb v%s\n" "$VERSION"; exit 0;; esac; [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; case ${1:-} in install-manager|self-update|35|uninstall-manager|uninstall-service|99) ;; *) policy_migrate || exit 1;; esac; dispatch "$@"; fi
