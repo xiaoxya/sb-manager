@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.3** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.4** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -319,3 +319,7 @@ journalctl -u sing-box -n 50 --no-pager
 ## v2.2.3
 
 出站管理（菜单 10）新增 VLESS TCP REALITY 和 TLS。添加时输入 `vless`，填写服务器、端口、UUID、安全类型、Flow 和 SNI；REALITY 还需公钥、Short ID、uTLS 指纹。普通 TLS 使用系统证书验证。支持添加、修改、删除、测试和分流绑定；暂不支持 WS、gRPC、HTTPUpgrade 等非 TCP 传输，也不支持直接导入分享链接。应用前会执行原有中转测试及配置检查。
+
+## v2.2.4 Snell 支持
+
+新增 Snell 入站（服务端 v5/v6）和出站（客户端 v4/v6）。初始化三种模式时可选启用，也可在已有服务器通过 `sb add-snell`（主菜单 36）追加 Snell 入站。默认 TCP 8443，需自行开放防火墙及 NAT 映射。节点信息显示 PSK 等连接参数，请勿公开。添加出站时选择 `snell`，配置 PSK、版本等参数，测试通过后再应用。v5 服务端可使用 v4 兼容客户端；不支持 v5 QUIC 模式。需要支持 Snell 的 sing-box 1.14.x 核心。尚未完成实机验证；分享链接导入尚未实现。
