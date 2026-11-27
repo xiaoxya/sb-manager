@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.4
+VERSION=2.2.5
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -361,7 +361,135 @@ proxy_change() ( local op=$1 t w exp; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w
 proxy_delete(){ local t; t=$(select_proxy) || return 1; [[ $t != direct ]] || { err '不能删除直连出站'; return 1; }; # conservative reference check, includes saved policies
  if jq -e --arg t "$t" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' "$C" >/dev/null || { [[ -s $POLICY ]] && jq -e --arg t "$t" 'any(..|strings;.==$t)' "$POLICY" >/dev/null; }; then err '仍被配置或已保存策略引用'; return 1; fi; confirm '删除出站?' && edit --arg t "$t" '.outbounds |= map(select(.tag!=$t))'; }
 set_final(){ local t; t=$(route_target) || return 1; [[ $t != reject ]] || return 1; confirm '修改默认出站?' && edit --arg t "$t" '.route.final=$t'; }
-proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 0|00) return;; esac; done; }
+# Parse supported share URLs from stdin. Credentials are not command arguments.
+parse_share_link(){
+ python3 -c '
+import sys,json,re,base64,uuid
+from urllib.parse import urlsplit,parse_qs,unquote
+class Invalid(Exception): pass
+def check(ok,msg):
+ if not ok: raise Invalid(msg)
+def b64(s):
+ return base64.b64decode(s+"="*(-len(s)%4),altchars=b"-_",validate=True)
+def boolean(s):
+ check(s.lower() in ("0","1","true","false"),"布尔参数无效")
+ return s.lower() in ("1","true")
+def parse(raw,tag):
+ raw=raw.strip()
+ check(0<len(raw)<=16384 and not re.search(r"\s",raw),"请输入单条完整分享链接")
+ scheme,sep,body=raw.partition("://")
+ scheme=scheme.lower()
+ check(sep and scheme in ("vless","anytls","hy2","hysteria2","ss"),"不支持的分享链接协议")
+ if scheme=="ss" and "@" not in body.split("#",1)[0].split("?",1)[0]:
+  check("?" not in body.split("#",1)[0],"旧式 SS 链接不支持扩展参数")
+  raw="ss://"+b64(unquote(body.split("#",1)[0])).decode()
+ x=urlsplit(raw)
+ q=parse_qs(x.query,keep_blank_values=True,strict_parsing=True)
+ check(all(len(v)==1 for v in q.values()),"查询参数重复")
+ def g(k,d=""): return q.get(k,[d])[0]
+ def only(keys): check(set(q)<=set(keys.split()),"包含暂不支持的扩展参数")
+ host=x.hostname; port=x.port
+ check(host and port and 1<=port<=65535 and not any(c in host for c in "/\\\x00"),"服务器地址或端口无效")
+ check(x.path in ("","/"),"不支持此链接路径")
+ user=unquote(x.username or "")
+ pw=user+(":"+unquote(x.password) if x.password is not None else "")
+ o={"type":{"hy2":"hysteria2","ss":"shadowsocks"}.get(scheme,scheme),"tag":tag,"server":host,"server_port":port,"domain_resolver":{"server":"local-dns","strategy":"ipv4_only"}}
+ def tls():
+  sni=g("sni"); peer=g("peer")
+  check(not(sni and peer and sni!=peer),"SNI 参数冲突")
+  t={"enabled":True,"server_name":sni or peer or host}
+  flags=[boolean(g(k)) for k in ("insecure","allowInsecure") if g(k)]
+  check(not flags or all(v==flags[0] for v in flags),"证书校验参数冲突")
+  if flags: t["insecure"]=flags[0]
+  pins=[b64(g(k)) for k in ("pinSHA256","certificate_public_key_sha256") if g(k)]
+  if pins:
+   check(all(len(p)==32 and p==pins[0] for p in pins),"公钥指纹格式无效或冲突")
+   t["certificate_public_key_sha256"]=[base64.b64encode(pins[0]).decode()]
+  if g("alpn"): t["alpn"]=g("alpn").split(",")
+  return t
+ if scheme=="vless":
+  only("encryption security type flow sni peer fp pbk sid spx headerType alpn insecure allowInsecure")
+  check(x.password is None,"VLESS 用户信息无效")
+  o["uuid"]=str(uuid.UUID(user))
+  check(g("encryption","none")=="none","不支持 VLESS 加密扩展")
+  check(g("type","tcp") in ("tcp","raw") and g("headerType","none")=="none","仅支持 TCP/RAW VLESS")
+  check(g("flow") in ("","xtls-rprx-vision"),"不支持的 Flow")
+  if g("flow"): o["flow"]=g("flow")
+  sec=g("security","none")
+  check(sec in ("reality","tls"),"仅支持 VLESS REALITY 或 TLS")
+  t=tls()
+  check(not t.get("insecure"),"VLESS 不允许关闭证书验证")
+  if sec=="reality":
+   pbk=g("pbk"); sid=g("sid")
+   check(bool(re.fullmatch(r"[A-Za-z0-9_-]{43}",pbk)) and len(b64(pbk))==32,"REALITY 公钥无效")
+   check(bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}){0,8}",sid)),"REALITY Short ID 无效")
+   check(g("spx") in ("","/"),"不支持自定义 spiderX")
+   t["utls"]={"enabled":True,"fingerprint":g("fp") or "chrome"}
+   t["reality"]={"enabled":True,"public_key":pbk,"short_id":sid}
+  else:
+   check(not any(g(k) for k in ("pbk","sid","spx")),"TLS 链接包含 REALITY 参数")
+   if g("fp"): t["utls"]={"enabled":True,"fingerprint":g("fp")}
+  o["tls"]=t
+ elif scheme in ("anytls","hy2","hysteria2"):
+  only("sni peer insecure allowInsecure pinSHA256 certificate_public_key_sha256 alpn obfs obfs-password")
+  check(pw,"缺少节点密码")
+  o.update(password=pw,tls=tls())
+  if scheme=="anytls":
+   check(not g("obfs") and not g("obfs-password"),"AnyTLS 不支持此混淆")
+  elif g("obfs"):
+   check(g("obfs")=="salamander" and g("obfs-password"),"仅支持带密码的 Salamander 混淆")
+   o["obfs"]={"type":"salamander","password":g("obfs-password")}
+  else: check(not g("obfs-password"),"缺少混淆类型")
+ else:
+  only("")
+  auth=pw if ":" in pw else b64(pw).decode()
+  method,sep,key=auth.partition(":")
+  check(sep and key,"SS 认证信息无效")
+  check(method in ("2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305","aes-128-gcm","aes-192-gcm","aes-256-gcm","chacha20-ietf-poly1305","xchacha20-ietf-poly1305"),"不支持此 SS 加密算法")
+  if method.startswith("2022-"):
+   n=16 if method=="2022-blake3-aes-128-gcm" else 32
+   check(all(len(b64(k))==n for k in key.split(":")),"SS2022 密钥长度无效")
+  o.update(method=method,password=key)
+ return o
+try:
+ print(json.dumps(parse(sys.stdin.read(),sys.argv[1]),ensure_ascii=False))
+except Invalid as e:
+ print("导入失败："+str(e),file=sys.stderr); sys.exit(1)
+except Exception:
+ print("导入失败：链接格式或参数无效",file=sys.stderr); sys.exit(1)
+' "$1"
+}
+proxy_import() (
+ local w link t exp pin
+ [[ -s $C ]] || { err '请先初始化'; exit 1; }
+ need python3 jq curl sing-box || exit 1
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ t=$(ask '新出站唯一标签' relay-import) || exit 1
+ [[ $t =~ ^[A-Za-z0-9_.-]+$ && $t != direct && $t != reject ]] || { err '标签无效'; exit 1; }
+ jq -e --arg t "$t" 'any(.outbounds[];.tag==$t)' "$C" >/dev/null && { err '标签重复'; exit 1; }
+ read -rs -p '粘贴单条分享链接（不回显）: ' link || exit 1
+ echo
+ printf '%s' "$link" | parse_share_link "$t" > "$w/o" || exit 1
+ unset link
+ if jq -e '.type=="anytls" or .type=="hysteria2"' "$w/o" >/dev/null; then
+  pin=$(ask 'TLS SPKI SHA256 Base64（可选，回车保留链接设置）' '') || exit 1
+  if [[ -n $pin ]]; then
+   [[ $pin =~ ^[A-Za-z0-9+/]{43}=$ ]] || { err '指纹格式不正确'; exit 1; }
+   jq --arg pin "$pin" '.tls.certificate_public_key_sha256=[$pin]|.tls.insecure=false' "$w/o" > "$w/next" && mv "$w/next" "$w/o" || exit 1
+  fi
+ fi
+ if jq -e '.tls.insecure==true' "$w/o" >/dev/null; then
+  confirm '警告：链接关闭证书验证，存在中间人风险，仍继续?' || exit 0
+ fi
+ msg OK '链接解析成功（隐藏认证信息）'
+ jq 'del(.password,.uuid,.obfs.password,.psk,.userkey)' "$w/o" || exit 1
+ exp=$(ask '预期出口 IP（回车仅验证连通性）' '') || exit 1
+ probe "$w/o" "$exp" || exit 1
+ confirm '测试通过，添加出站配置?' || exit 0
+ jq -e --arg t "$t" 'any(.outbounds[];.tag==$t)' "$C" >/dev/null && { err '标签已存在'; exit 1; }
+ edit --slurpfile o "$w/o" '.outbounds += $o'
+)
+proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|08 分享链接导入|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 8|08) proxy_import;; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
 POLICY=/etc/sing-box/sb-policy.json
 policy_ready(){ if [[ ! -e $POLICY ]]; then printf '{"disabled":[],"saved":null}\n' > "$POLICY"; fi; jq -e 'type=="object" and (.disabled|type=="array")' "$POLICY" >/dev/null; }
@@ -414,6 +542,6 @@ menu(){ local n; while true; do
  dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|add-snell) add_snell;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|add-snell) add_snell;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; import-node|import-outbound) proxy_import;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; dispatch "$@"; fi
