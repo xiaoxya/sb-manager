@@ -2,7 +2,7 @@
 # 通用 sing-box 管理工具，面向 Debian/Ubuntu systemd, sing-box 1.14.x
 set -uo pipefail
 umask 077
-VERSION=2.2.3
+VERSION=2.2.4
 C=/etc/sing-box/config.json
 D=/var/lib/sing-box
 B=/root/sb-backups
@@ -90,14 +90,71 @@ make_vless(){
   jq -n --arg h "$host" --argjson p "$p" --arg id "$uuid" --arg flow "$flow" --arg s "$sni" '{type:"vless",tag:"relay-out",server:$h,server_port:$p,uuid:$id,flow:$flow,domain_resolver:{server:"local-dns",strategy:"ipv4_only"},tls:{enabled:true,server_name:$s,insecure:false}}' > "$f"
  fi
 }
+make_snell(){
+ local f=$1 host=$2 p=$3 old=$4 prior='{}' v psk userkey mode obfs oh reuse
+ if [[ -f $old ]] && jq -e '.type=="snell"' "$old" >/dev/null; then prior=$(cat "$old") || return 1; fi
+ v=$(ask 'Snell 客户端版本 4/6（v5 服务端使用 4）' "$(jq -r '.version // 6' <<< "$prior")") || return 1
+ [[ $v == 4 || $v == 6 ]] || { err '仅支持官方核心出站版本 4/6'; return 1; }
+ psk=$(secret 'Snell PSK（编辑时回车保留）') || return 1
+ [[ -n $psk ]] || psk=$(jq -r '.psk // ""' <<< "$prior")
+ [[ -n $psk ]] || { err 'PSK 必填'; return 1; }
+ if [[ $v == 6 ]]; then
+  local bytes; bytes=$(printf '%s' "$psk" | wc -c)
+  ((bytes>=12 && bytes<=255)) || { err 'v6 PSK 长度必须为12至255字节'; return 1; }
+ fi
+ userkey=$(secret '多用户 userkey（可选，回车保留，none 清除）') || return 1
+ [[ -n $userkey ]] || userkey=$(jq -r '.userkey // ""' <<< "$prior")
+ [[ $userkey != none ]] || userkey=''
+ reuse=$(ask '连接复用 true/false' "$(jq -r '.reuse // false' <<< "$prior")") || return 1
+ [[ $reuse == true || $reuse == false ]] || return 1
+ if [[ $v == 6 ]]; then
+  mode=$(ask '流量整形 default/unshaped' "$(jq -r '.mode // "default"' <<< "$prior")") || return 1
+  [[ $mode == default || $mode == unshaped ]] || { err '不支持该整形模式'; return 1; }
+  jq -n --arg h "$host" --argjson p "$p" --arg psk "$psk" --arg u "$userkey" --arg mode "$mode" --argjson reuse "$reuse" '{type:"snell",tag:"relay-out",server:$h,server_port:$p,version:6,psk:$psk,mode:$mode,reuse:$reuse,domain_resolver:{server:"local-dns",strategy:"ipv4_only"}}+ (if $u=="" then {} else {userkey:$u} end)' > "$f"
+ else
+  obfs=$(ask 'HTTP 混淆 none/http' "$(jq -r '.obfs_mode // "none"' <<< "$prior")") || return 1
+  [[ $obfs == none || $obfs == http ]] || return 1
+  oh=''; if [[ $obfs == http ]]; then oh=$(ask '混淆 Host' "$(jq -r '.obfs_host // "bing.com"' <<< "$prior")") || return 1; fi
+  jq -n --arg h "$host" --argjson p "$p" --arg psk "$psk" --arg u "$userkey" --arg obfs "$obfs" --arg oh "$oh" --argjson reuse "$reuse" '{type:"snell",tag:"relay-out",server:$h,server_port:$p,version:4,psk:$psk,obfs_mode:$obfs,reuse:$reuse,domain_resolver:{server:"local-dns",strategy:"ipv4_only"}}+(if $u=="" then {} else {userkey:$u} end)+(if $oh=="" then {} else {obfs_host:$oh} end)' > "$f"
+ fi
+}
+snell_inbound(){
+ local cfg=$1 out=$2 p v psk mode obfs
+ p=$(ask 'Snell TCP 监听端口' 8443) || return 1; port "$p" || return 1; p=$((10#$p))
+ jq -e --argjson p "$p" 'any(.inbounds[];.listen_port==$p and .type!="hysteria2")' "$cfg" >/dev/null && { err 'Snell TCP 端口与现有入站冲突'; return 1; }
+ v=$(ask 'Snell 服务端版本 5/6' 6) || return 1
+ [[ $v == 5 || $v == 6 ]] || { err '服务端仅支持5/6'; return 1; }
+ psk=$(openssl rand -hex 24) || return 1
+ if [[ $v == 6 ]]; then
+  mode=$(ask '流量整形 default/unshaped' default) || return 1
+  [[ $mode == default || $mode == unshaped ]] || return 1
+  jq --argjson p "$p" --arg k "$psk" --arg m "$mode" '.inbounds += [{type:"snell",tag:"snell-in",listen:"0.0.0.0",listen_port:$p,version:6,psk:$k,mode:$m}]' "$cfg" > "$out"
+ else
+  obfs=$(ask 'HTTP 混淆 none/http' none) || return 1
+  [[ $obfs == none || $obfs == http ]] || return 1
+  jq --argjson p "$p" --arg k "$psk" --arg m "$obfs" '.inbounds += [{type:"snell",tag:"snell-in",listen:"0.0.0.0",listen_port:$p,version:5,psk:$k,obfs_mode:$m}]' "$cfg" > "$out"
+ fi
+}
+add_snell() (
+ local w; [[ -s $C ]] || { err '请先初始化'; exit 1; }
+ jq -e 'any(.inbounds[];.tag=="snell-in")' "$C" >/dev/null && { err 'snell-in 已存在'; exit 1; }
+ w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT
+ snell_inbound "$C" "$w/config.json" || exit 1
+ confirm '添加 Snell 入站（将检查配置并重启服务）?' || exit 0
+ apply "$w/config.json" && info
+)
 make_relay(){
  local f=$1 type host p pw sni key method old=${2:-} default=anytls
  [[ -f $old ]] && default=$(jq -r '.type' "$old")
- type=$(ask '协议 anytls/shadowsocks/hysteria2/vless' "$default") || return 1
- case $type in anytls) p=59007;; shadowsocks) p=18834;; hysteria2) p=21196;; vless) p=443;; *) err '协议错误'; return 1;; esac
+ type=$(ask '协议 anytls/shadowsocks/hysteria2/vless/snell' "$default") || return 1
+ case $type in anytls) p=59007;; shadowsocks) p=18834;; hysteria2) p=21196;; vless) p=443;; snell) p=8443;; *) err '协议错误'; return 1;; esac
  host=$(ask '落地公网域名/IP' "$( [[ -f $old ]] && jq -r '.server' "$old" || echo landing.example.com )") || return 1
  if [[ -f $old && $(jq -r '.type' "$old") == "$type" ]]; then p=$(jq -r '.server_port' "$old"); fi
  p=$(ask '公网端口' "$p"); port "$p" || return 1; p=$((10#$p))
+ if [[ $type == snell ]]; then
+  make_snell "$f" "$host" "$p" "$old"
+  return $?
+ fi
  if [[ $type == vless ]]; then
   make_vless "$f" "$host" "$p" "$old"
   return $?
@@ -152,11 +209,12 @@ init_role() (
      if [[ $choice == n ]]; then jq --arg t "$t" '.inbounds |= map(select(.tag!=$t))' "$w/final" > "$w/next" && mv "$w/next" "$w/final" || exit 1; fi
    fi
  done
+ if confirm '额外启用 Snell 入站?'; then snell_inbound "$w/final" "$w/next" && mv "$w/next" "$w/final" || exit 1; fi
  jq -e '.inbounds|length>0' "$w/final" >/dev/null || { err '至少启用一个入站'; exit 1; }
  apply "$w/final" || exit 1; rm -f "$POLICY"; printf '%s\n' "$host" > "$META"; systemctl enable sing-box; info
 )
 info(){
- local h; h=$(cat "$META" 2>/dev/null || echo '未设置公网地址'); echo "公网连接地址: $h"; jq -r '.inbounds[]|{type,tag,listen_port,users,password,method,tls:(.tls|if . then {server_name,certificate_path,reality:(.reality|if . then {short_id,handshake} else null end)} else null end)}' "$C"
+ local h; h=$(cat "$META" 2>/dev/null || echo '未设置公网地址'); echo "公网连接地址: $h"; jq -r '.inbounds[]|{type,tag,listen_port,users,password,method,version,psk,mode,obfs_mode,tls:(.tls|if . then {server_name,certificate_path,reality:(.reality|if . then {short_id,handshake} else null end)} else null end)}' "$C"
  local certpath; certpath=$(jq -r '[.inbounds[]|.tls.certificate_path // empty][0] // empty' "$C"); [[ -z $certpath ]] || { printf 'TLS SPKI SHA256 Base64: '; pin "$certpath"; echo; }
  local k; k=$(jq -r '.inbounds[]|.tls.reality.private_key // empty' "$C"); [[ -z $k ]] || { printf 'REALITY PublicKey: '; public_key "$k"; }
  if [[ $h != '未设置公网地址' ]]; then
@@ -192,13 +250,20 @@ for i in c['inbounds']:
    if user.get('flow'): q['flow']=user['flow']
    name=i.get('tag','vless-reality')+'-'+(user.get('name') or 'client')
    print(f"vless://{u.quote(uuid,safe='')}@{h}:{p}?{u.urlencode(q)}#{u.quote(name,safe='')}")
+ elif t=='snell':
+  version=4 if i.get('version')==5 else i.get('version',6)
+  endpoint=h
+  params=[f"snell, {endpoint}, {p}",f"psk={i.get('psk','')}",f"version={version}"]
+  if version==4 and i.get('obfs_mode')=='http': params.extend(['obfs=http','obfs-host=bing.com'])
+  if version==6: params.append("mode="+i.get('mode','default'))
+  print("Snell 参数（Surge 风格，客户端字段可能不同）: "+', '.join(params))
  elif t=='shadowsocks':
   auth=base64.urlsafe_b64encode((i['method']+':'+i['password']).encode()).decode().rstrip('=')
   print(f"ss://{auth}@{h}:{p}#{i['tag']}")
 PYLINK
  echo '自签链接中的 insecure=1 仅为兼容部分客户端；优先手动设置上面的公钥指纹。'
  fi
- jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless")|del(.password,.obfs.password,.uuid)' "$C"
+ jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="snell")|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C"
 }
 reality_test() ( local w key pub; w=$(mktemp -d); trap 'rm -rf "$w"' EXIT; key=$(jq -er '.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.private_key' "$C") || exit 1; pub=$(public_key "$key") || exit 1; jq --arg pub "$pub" '.inbounds[]|select(.tag=="vless-reality-in")|{type:"vless",tag:"reality-test",server:"127.0.0.1",server_port:.listen_port,uuid:.users[0].uuid,flow:.users[0].flow,tls:{enabled:true,server_name:.tls.server_name,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:.tls.reality.short_id[0]}}}' "$C" > "$w/o" && probe "$w/o"; )
 fix_rules(){ local f; f=$(mktemp); rules > "$f"; edit --slurpfile r "$f" '.http_clients=((.http_clients // [])|map(select(.tag!="rule-download")))+$r[0].http_clients|.route.default_http_client="rule-download"|.route.rule_set |= map(if .type=="remote" and (.http_client == null or .http_client == "rule-download") then del(.download_detour,.http_client) else . end)'; local rc=$?; rm -f "$f"; return "$rc"; }
@@ -219,7 +284,7 @@ monitor(){ local filter; filter=$(ask '日志筛选（all/ai/crypto/tiktok/anytl
 restore(){ local f; ls -1d "$B"/* 2>/dev/null; f=$(ask '输入完整备份目录' ''); [[ -f $f/sing-box/config.json ]] || return 1; confirm '恢复 JSON（证书需与备份一致）?' && apply "$f/sing-box/config.json"; }
 change_port(){ local tag p; jq -r '.inbounds[]|"\(.tag) \(.listen_port)"' "$C"; tag=$(ask '入站标签' anytls-in); jq -e --arg t "$tag" 'any(.inbounds[];.tag==$t)' "$C" >/dev/null || return 1; p=$(ask '内部监听端口' ''); port "$p" || return 1; edit --arg t "$tag" --argjson p "$((10#$p))" '(.inbounds[]|select(.tag==$t)|.listen_port)=$p'; }
 ntp(){ case $(virt) in podman|docker|lxc|openvz|container*) echo '容器时间由宿主机管理'; date -u;; *) apt-get install -y systemd-timesyncd && systemctl enable --now systemd-timesyncd; timedatectl status;; esac; }
-diagnose(){ cat /etc/os-release; virt; date -u; sing-box version; systemctl status sing-box --no-pager; ss -lntup; df -h /; jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless")|del(.password,.obfs.password,.uuid)' "$C"; journalctl -u sing-box -n 20 --no-pager; }
+diagnose(){ cat /etc/os-release; virt; date -u; sing-box version; systemctl status sing-box --no-pager; ss -lntup; df -h /; jq '.outbounds[]|select(.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="snell")|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C"; journalctl -u sing-box -n 20 --no-pager; }
 tls_target(){ local t; t=$(ask 'REALITY目标域名' www.apple.com); timeout 10 openssl s_client -connect "$t:443" -servername "$t" -tls1_3 -brief </dev/null; if confirm '修改 REALITY 目标?'; then edit --arg t "$t" '(.inbounds[]|select(.tag=="vless-reality-in")|.tls.server_name)=$t|(.inbounds[]|select(.tag=="vless-reality-in")|.tls.reality.handshake.server)=$t'; fi; }
 foreground() ( confirm '停止正式服务并前台调试?' || exit 0; local active=0; systemctl is-active --quiet sing-box && active=1; trap '((active==0)) || systemctl start sing-box' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; systemctl stop sing-box && sing-box run -D "$D" -c "$C"; )
 disk(){ df -h /; du -sh /var/log/journal /var/cache/apt /usr/lib/modules /boot /var/lib/apt/lists 2>/dev/null; }
@@ -289,14 +354,14 @@ else:
 }
 init_menu(){ local n; ui_title '初始化 sing-box 服务'; columns '01 独立代理（单 VPS）|02 入口中转|03 落地服务|00 返回' ''; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) init_role standalone;; 2|02) init_role entry;; 3|03) init_role landing;; 0|00) return;; *) err '无效选项';; esac; }
 proxy_list(){ jq -r '.outbounds[]|[.tag,.type,(.server // "-"),(.server_port // "-")]|@tsv' "$C"; }
-select_proxy(){ local t; proxy_list >&2; t=$(ask '出站标签' "${1:-relay-out}") || return 1; jq -e --arg t "$t" 'any(.outbounds[];.tag==$t and (.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="direct"))' "$C" >/dev/null || { err '出站不存在或类型不支持'; return 1; }; printf '%s' "$t"; }
+select_proxy(){ local t; proxy_list >&2; t=$(ask '出站标签' "${1:-relay-out}") || return 1; jq -e --arg t "$t" 'any(.outbounds[];.tag==$t and (.type=="anytls" or .type=="shadowsocks" or .type=="hysteria2" or .type=="vless" or .type=="snell" or .type=="direct"))' "$C" >/dev/null || { err '出站不存在或类型不支持'; return 1; }; printf '%s' "$t"; }
 proxy_test() ( local t=$1 w; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT; jq -e --arg t "$t" '.outbounds[]|select(.tag==$t)' "$C" > "$w/o" || exit 1; if jq -e 'has("detour")' "$w/o" >/dev/null; then err '链式 detour 出站暂不支持独立测试'; exit 1; fi; jq 'if .server then .domain_resolver={server:"local-dns",strategy:"ipv4_only"} else . end' "$w/o" > "$w/test" || exit 1; probe "$w/test" "${2:-}"; )
 relay(){ local t; t=$(relay_tag 2>/dev/null) || t=$(select_proxy) || return 1; proxy_test "$t" "${1:-}"; }
 proxy_change() ( local op=$1 t w exp; w=$(mktemp -d) || exit 1; trap 'rm -rf "$w"' EXIT; if [[ $op == add ]]; then t=$(ask '新出站唯一标签' relay-out) || exit 1; [[ $t =~ ^[A-Za-z0-9_.-]+$ && $t != direct && $t != reject ]] || exit 1; jq -e --arg t "$t" 'any(.outbounds[];.tag==$t)' "$C" >/dev/null && { err '标签重复'; exit 1; }; make_relay "$w/new" || exit 1; else t=$(select_proxy) || exit 1; jq -e --arg t "$t" '.outbounds[]|select(.tag==$t and .type!="direct")' "$C" > "$w/old" || exit 1; make_relay "$w/new" "$w/old" || exit 1; fi; jq --arg t "$t" '.tag=$t' "$w/new" > "$w/tagged" || exit 1; exp=$(ask '预期出口 IP（回车仅验证连通性）' '') || exit 1; probe "$w/tagged" "$exp" || exit 1; confirm '应用出站配置?' || exit 0; edit --arg t "$t" --slurpfile o "$w/tagged" '.outbounds |= (if any(.[];.tag==$t) then map(if .tag==$t then $o[0] else . end) else .+$o end)'; )
 proxy_delete(){ local t; t=$(select_proxy) || return 1; [[ $t != direct ]] || { err '不能删除直连出站'; return 1; }; # conservative reference check, includes saved policies
  if jq -e --arg t "$t" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' "$C" >/dev/null || { [[ -s $POLICY ]] && jq -e --arg t "$t" 'any(..|strings;.==$t)' "$POLICY" >/dev/null; }; then err '仍被配置或已保存策略引用'; return 1; fi; confirm '删除出站?' && edit --arg t "$t" '.outbounds |= map(select(.tag!=$t))'; }
 set_final(){ local t; t=$(route_target) || return 1; [[ $t != reject ]] || return 1; confirm '修改默认出站?' && edit --arg t "$t" '.route.final=$t'; }
-proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless")|.tag' "$C");; 0|00) return;; esac; done; }
+proxy_menu(){ local n t; [[ -s $C ]] || return 1; while true; do ui_title '出站节点管理'; proxy_list; columns '01 查看出站详情|02 添加出站|03 修改出站|04 删除出站' '05 测试指定出站|06 设置默认出站|07 测试全部出站|00 返回'; read -rp "$(ui_prompt '请选择操作：')" n || return; case $n in 1|01) t=$(select_proxy) && jq --arg t "$t" '.outbounds[]|select(.tag==$t)|del(.password,.obfs.password,.uuid,.psk,.userkey)' "$C";; 2|02) proxy_change add;; 3|03) proxy_change edit;; 4|04) proxy_delete;; 5|05) t=$(select_proxy) && proxy_test "$t";; 6|06) set_final;; 7|07) while IFS= read -r t; do echo "==== $t ===="; proxy_test "$t" || echo '[FAIL]'; done < <(jq -r '.outbounds[]|select(.type=="direct" or .type=="anytls" or .type=="hysteria2" or .type=="shadowsocks" or .type=="vless" or .type=="snell")|.tag' "$C");; 0|00) return;; esac; done; }
 # Store disabled rules and mode snapshots outside the native config.
 POLICY=/etc/sing-box/sb-policy.json
 policy_ready(){ if [[ ! -e $POLICY ]]; then printf '{"disabled":[],"saved":null}\n' > "$POLICY"; fi; jq -e 'type=="object" and (.disabled|type=="array")' "$POLICY" >/dev/null; }
@@ -343,12 +408,12 @@ menu(){ local n; while true; do
  paint '36' '--------------------------------------------------------'; printf '\n'
  columns '◆ 服务与节点管理|01 安装/更新核心|02 初始化服务|03 启动服务|04 停止服务|05 重启服务|06 服务状态|07 实时日志|08 节点信息|09 修改监听端口|10 出站节点管理|11 修复规则下载|12 中转测试|13 日志级别|14 REALITY 测试|15 REALITY 公钥|16 TLS 目标管理|27 开机启动' '◆ 系统维护与分流|17 时间同步|18 系统诊断|19 前台调试|20 修复权限|21 备份配置|22 恢复 JSON|23 磁盘检查|24 安全清理|25 限制日志|26 BBR 状态|28 分流规则管理|29 智能分流测试|30 实时流量监控|31 域名访问统计|32 AnyTLS 连接|33 网卡实时速率|34 设置公网地址'
  paint '36' '--------------------------------------------------------'; printf '\n'
- columns '35 更新管理器' '00 退出管理工具'
+ columns '35 更新管理器|36 添加 Snell 入站' '00 退出管理工具'
  read -rp "$(ui_prompt '请输入功能编号：')" n || return
  [[ $n == 0 || $n == 00 ]] && return
  dispatch "$n"; read -rp "$(ui_prompt '回车继续...')" _ || return
  done; }
 
-dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
+dispatch(){ local n=${1:-}; if [[ $n =~ ^0[0-9]$ ]]; then n=$((10#$n)); fi; case $n in '') menu;; 35|self-update) self_update;; 36|add-snell) add_snell;; init-standalone) init_role standalone;; 10|outbounds) proxy_menu;; change-relay) proxy_change edit;; test-outbound) [[ -n ${2:-} ]] && proxy_test "$2" "${3:-}";; *) legacy_dispatch "$n" "${@:2}";; esac; }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then [[ $EUID == 0 ]] || { err '请使用 root'; exit 1; }; dispatch "$@"; fi
