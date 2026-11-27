@@ -2,13 +2,13 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.2** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.3** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
 - 独立代理、入口中转、落地服务三种初始化模式。
 - Hysteria2、AnyTLS、VLESS REALITY 入站；落地机可选 SS2022。
-- AnyTLS、Shadowsocks、Hysteria2 多中转出站，自定义标签。
+- AnyTLS、Shadowsocks、Hysteria2、VLESS 多中转出站，自定义标签。
 - 自定义域名、IP 网段及远程规则集分流，支持规则增删改、排序、启停。
 - 27 项预设规则集选项，支持逗号多选，添加时检测下载可用性。
 - 智能分流、全局直连、全局中转模式及分流配置导入导出。
@@ -141,7 +141,7 @@ sb test-route
 04 删除出站           00 返回
 ```
 
-添加节点时可使用 `relay-jp`、`relay-us` 等自定义标签，选择 anytls / shadowsocks / hysteria2，填写公网地址、端口及密码。TLS 协议需填写 SNI 和证书公钥指纹；HY2 可选 Salamander 混淆。输入预期出口 IP 可额外验证出口是否正确。
+添加节点时可使用 `relay-jp`、`relay-us` 等自定义标签，选择 anytls / shadowsocks / hysteria2 / vless，填写公网地址、端口及密码。TLS 协议需填写 SNI 和证书公钥指纹；HY2 可选 Salamander 混淆。输入预期出口 IP 可额外验证出口是否正确。
 
 ```bash
 sb test-outbound relay-jp
@@ -315,3 +315,7 @@ journalctl -u sing-box -n 50 --no-pager
 ## v2.2.2
 
 `sb info`（菜单 08）新增 VLESS REALITY TCP 分享链接，自动读取 UUID、SNI、Flow、Short ID，并计算公钥。若公网端口与内部监听端口不同，请手动调整链接端口。未设置公网连接地址时先使用菜单 34 设置。非 TCP REALITY 暂不生成链接。
+
+## v2.2.3
+
+出站管理（菜单 10）新增 VLESS TCP REALITY 和 TLS。添加时输入 `vless`，填写服务器、端口、UUID、安全类型、Flow 和 SNI；REALITY 还需公钥、Short ID、uTLS 指纹。普通 TLS 使用系统证书验证。支持添加、修改、删除、测试和分流绑定；暂不支持 WS、gRPC、HTTPUpgrade 等非 TCP 传输，也不支持直接导入分享链接。应用前会执行原有中转测试及配置检查。
