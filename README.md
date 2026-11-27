@@ -2,7 +2,7 @@
 
 面向 Debian / Ubuntu 的 sing-box 部署、节点管理、智能分流及维护工具。支持单 VPS、双 VPS 和多落地出站架构，不限制服务器所在地区。
 
-**当前版本：v2.2.26** · 目标核心版本：sing-box 1.14.x · Bash / systemd
+**当前版本：v2.2.27** · 目标核心版本：sing-box 1.14.x · Bash / systemd
 
 ## 功能
 
@@ -411,3 +411,7 @@ AnyTLS/HY2 可补充 Base64 SPKI SHA256 公钥指纹；若链接关闭证书验�
 ## v2.2.26 智能分流测试模式适配
 
 菜单 29 / `sb test-route` 自动推荐 direct、global、smart、custom 测试模式，并允许手动选择。独立代理或无路由转发规则且默认出站为 direct 时，所有测试域名预期直连；全局模式使用默认出站；识别到预设智能分流规则时使用中转预期；其他配置建议 custom，仅检测实际出站。可选通过 ipinfo.io 查询 VPS 直连 IPv4 公网国家/地区并手动设置显示别名，不是逐站点或中转出口地理定位。HTTP 4xx/5xx 单独提示，不等同于分流失败。测试仍使用临时实例，依赖特定入站标签的规则可能与正式服务不同。更新不修改配置或重启服务。尚未 VPS 实机测试。
+
+## v2.2.27 TLS 证书管理
+
+主菜单 38 / `sb cert`。采用 Debian/Ubuntu APT 安装 Certbot 与 Cloudflare DNS 插件，使用独立 `/var/lib/sb-manager/acme` 状态，Let's Encrypt ECC P-256、续期复用私钥；支持 standalone HTTP-01、Cloudflare DNS-01、根域名加通配符、导入现有证书、查看/到期检测、部署、续期、定时器、SPKI 指纹、TCP TLS 验证、备份证书恢复和删除未绑定的 ACME 证书。HTTP-01 要求 TCP 80 公网可达且未被占用，不自动停其他服务；DNS Token 以 0600 文件保存，限对应 Zone。签发与部署分离；仅替换管理器共享证书路径，校验证书私钥匹配和域名覆盖，必要时经确认更新共享证书入站 SNI，备份配置及证书并在失败时尝试回滚。首次换证书可能改变 SPKI，客户端需要同步更新 SNI/固定指纹。自动续期需手动启用 sb-cert-renew.timer，自动部署拒绝 SPKI 或 SNI 不匹配，保留原有服务状态。Argo 公网 TLS 由 Cloudflare 处理，REALITY 不使用该证书；TCP TLS 验证不适用于仅 UDP 的 Hysteria2。卸载移除专用定时器和 ACME 状态，保留可能共享的 Certbot 软件包及默认 Certbot 定时器。更新管理器本身不申请证书、不重启服务。尚未进行真实 CA 签发、续期或 VPS 部署测试。
